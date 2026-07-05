@@ -176,6 +176,112 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
     Ok(())
 }
 
+/// Open `path` with `action` and place the cursor at `pos`, centered — the
+/// shared tail of the `:open`-family file opens (mirrors `open_impl`'s file
+/// branch). Used by the window-picker paths in this file and by the picker
+/// resolve in `ui::EditorView::handle_event`, so cursor/scroll behavior can't
+/// drift between them.
+pub(crate) fn open_and_align(
+    editor: &mut Editor,
+    path: &std::path::Path,
+    pos: Position,
+    action: Action,
+) -> anyhow::Result<()> {
+    let _ = editor.open(path, action)?;
+    let (view, doc) = current!(editor);
+    let sel = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+    doc.set_selection(view.id, sel);
+    align_view(doc, view, Align::Center);
+    Ok(())
+}
+
+/// Shared implementation for the window-picker open commands. If the file is
+/// already visible in a split, focus that split (nvim-tree's `found_win`).
+/// Otherwise, when more than one split is visible and every split can get a
+/// distinct label, arm the window picker: the next keypress (handled in
+/// `EditorView::handle_event`) chooses the split and the file opens IN it
+/// (`Action::Replace` — the picker never creates a window). In every other
+/// case act directly with `action`, exactly like `:open`/`:vsplit`/`:hsplit`
+/// — which is what makes `:vsplit-pick` grow a 1-window layout to two.
+/// A stale pick from a previous arming is always cleared, even when this call
+/// resolves through an early return.
+fn open_pick_impl(
+    cx: &mut compositor::Context,
+    args: Args,
+    action: Action,
+) -> anyhow::Result<()> {
+    // Whatever happens below, a previously-armed pick is superseded by this
+    // command: every path either re-arms or leaves the picker cleared.
+    cx.editor.clear_window_pick();
+
+    let arg = args.first().context("file path required")?;
+    let (path, pos) = crate::args::parse_file(arg);
+    let path = helix_stdx::path::expand_tilde(path).into_owned();
+
+    // A directory has no split to pick into — defer to the normal directory picker.
+    if path.is_dir() {
+        return open_impl(cx, args, action);
+    }
+
+    // nvim-tree parity: if the file is already visible in a window, just focus
+    // that window — no picker, no reopen, no new split. (nvim-tree's `found_win`
+    // check runs before any mode handling.) A file that is open as a buffer but
+    // not displayed anywhere falls through to the normal flow below.
+    let canonical = helix_stdx::path::canonicalize(&path);
+    if let Some(doc_id) = cx.editor.document_id_by_path(&canonical) {
+        let visible = cx
+            .editor
+            .tree
+            .views()
+            .find_map(|(view, _)| (view.doc == doc_id).then_some(view.id));
+        if let Some(view_id) = visible {
+            cx.editor.focus(view_id);
+            // Honor an explicit `file:line[:col]` suffix like `:open` would.
+            // A default pos is indistinguishable from "no pos given", so only
+            // a non-default one repositions (nvim-tree jumps without moving
+            // the cursor at all).
+            if pos != Position::default() {
+                let (view, doc) = current!(cx.editor);
+                let sel = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+                doc.set_selection(view.id, sel);
+                align_view(doc, view, Align::Center);
+            }
+            return Ok(());
+        }
+    }
+
+    // Arm the picker when there are 2+ splits and enough distinct labels for
+    // all of them (arm_window_pick refuses partial labeling). Otherwise act
+    // directly with the caller's action. Schedule a redraw so the labels paint
+    // (the socket command path does not render on its own).
+    if cx.editor.tree.views().count() > 1 && cx.editor.arm_window_pick(path.clone(), pos) {
+        helix_event::request_redraw();
+        return Ok(());
+    }
+    open_and_align(cx.editor, &path, pos, action)
+}
+
+fn open_pick(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    open_pick_impl(cx, args, Action::Replace)
+}
+
+fn vsplit_pick(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    open_pick_impl(cx, args, Action::VerticalSplit)
+}
+
+fn hsplit_pick(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    open_pick_impl(cx, args, Action::HorizontalSplit)
+}
+
 fn buffer_close_by_ids_impl(
     cx: &mut compositor::Context,
     doc_ids: &[DocumentId],
@@ -3058,6 +3164,39 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::all(completers::filename),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "open-pick",
+        aliases: &[],
+        doc: "Open a file, prompting with a per-split label when multiple splits exist.",
+        fun: open_pick,
+        completer: CommandCompleter::all(completers::filename),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "vsplit-pick",
+        aliases: &[],
+        doc: "Vertically split a file, prompting which split to split from when multiple exist.",
+        fun: vsplit_pick,
+        completer: CommandCompleter::all(completers::filename),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "hsplit-pick",
+        aliases: &[],
+        doc: "Horizontally split a file, prompting which split to split from when multiple exist.",
+        fun: hsplit_pick,
+        completer: CommandCompleter::all(completers::filename),
+        signature: Signature {
+            positionals: (1, Some(1)),
             ..Signature::DEFAULT
         },
     },

@@ -1270,6 +1270,19 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+/// State for an armed window picker (see `Editor::pending_window_pick`).
+/// Each entry maps a visible split's `ViewId` to the key char the resolving
+/// keypress is matched against (case-insensitively) plus the pre-rendered
+/// padded label drawn centered in that split's statusline. Resolving always
+/// opens the file IN the chosen split (`Action::Replace`) — the picker selects
+/// an existing window, it never creates one.
+#[derive(Debug)]
+pub struct PendingWindowPick {
+    pub path: PathBuf,
+    pub pos: Position,
+    pub labels: Vec<(ViewId, char, String)>,
+}
+
 pub struct Editor {
     /// Current editing mode.
     pub mode: Mode,
@@ -1311,6 +1324,11 @@ pub struct Editor {
 
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
     pub autoinfo: Option<Info>,
+    /// Armed window picker: when set, each split is labeled with a letter and
+    /// the next keypress selects the split to open `path` into. Set by the
+    /// `:open-pick` typable command, drawn in the editor render loop, and
+    /// resolved at the top of `EditorView::handle_event`.
+    pub pending_window_pick: Option<PendingWindowPick>,
 
     pub config: Arc<dyn DynAccess<Config>>,
     pub auto_pairs: Option<AutoPairs>,
@@ -1453,6 +1471,7 @@ impl Editor {
             ))),
             status_msg: None,
             autoinfo: None,
+            pending_window_pick: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
             last_motion: None,
@@ -2315,6 +2334,52 @@ impl Editor {
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
             self.focus(id)
         }
+    }
+
+    /// Arm the window picker: label every visible split with a letter from the
+    /// jump-label alphabet (in `tree.views()` order), to be drawn by the render
+    /// loop and resolved on the next keypress. Mapping is keyed by `ViewId`, so
+    /// it stays correct even if view iteration order changes between frames.
+    ///
+    /// Labels come from `jump_label_alphabet`, deduplicated case-insensitively
+    /// (matching is case-insensitive, so `a` and `A` would collide). Returns
+    /// `false` — arming nothing — when there are fewer distinct labels than
+    /// views: a partially-labeled picker would leave some splits silently
+    /// unpickable. Callers fall back to acting directly.
+    pub fn arm_window_pick(&mut self, path: PathBuf, pos: Position) -> bool {
+        let alphabet = &self.config().jump_label_alphabet;
+        let mut seen: Vec<char> = Vec::new();
+        let letters: Vec<char> = alphabet
+            .iter()
+            .copied()
+            .filter(|ch| {
+                let key = ch.to_ascii_lowercase();
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
+                }
+            })
+            .collect();
+        let views: Vec<ViewId> = self.tree.views().map(|(view, _)| view.id).collect();
+        if views.is_empty() || letters.len() < views.len() {
+            return false;
+        }
+        let labels = views
+            .into_iter()
+            .zip(letters)
+            // Pre-render the display label once here so the render loop just
+            // paints it: uppercase (nvim-tree style; `to_uppercase` may yield
+            // multiple chars, e.g. ß→SS) with padding for visibility.
+            .map(|(id, ch)| (id, ch, format!("  {}  ", ch.to_uppercase())))
+            .collect();
+        self.pending_window_pick = Some(PendingWindowPick { path, pos, labels });
+        true
+    }
+
+    pub fn clear_window_pick(&mut self) {
+        self.pending_window_pick = None;
     }
 
     pub fn swap_split_in_direction(&mut self, direction: tree::Direction) {

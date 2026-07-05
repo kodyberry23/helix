@@ -82,6 +82,11 @@ pub struct Application {
     theme_mode: Option<theme::Mode>,
     #[cfg(unix)]
     socket_rx: mpsc::Receiver<String>,
+
+    // Sidebar follow (local patch): pushes the focused document's path to
+    // the treelix sidebar on change. See crate::sidebar_follow.
+    #[cfg(unix)]
+    sidebar_follow: crate::sidebar_follow::SidebarFollow,
 }
 
 #[cfg(feature = "integration")]
@@ -321,12 +326,17 @@ impl Application {
             jobs,
             lsp_progress: LspProgressMap::new(),
             theme_mode,
+            #[cfg(unix)]
+            sidebar_follow: crate::sidebar_follow::SidebarFollow::from_env(),
         };
 
         Ok(app)
     }
 
     async fn render(&mut self) {
+        #[cfg(unix)]
+        self.sidebar_follow.sync(&self.editor);
+
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
@@ -877,6 +887,13 @@ impl Application {
                         return;
                     }
             }
+            // Any incoming socket command supersedes an armed window picker:
+            // the picker-arming commands re-arm during their own execution
+            // (open_pick_impl clears-then-arms), and for everything else the
+            // user has moved on — a stale pick must not resolve on a later
+            // unrelated keystroke. Clearing unconditionally avoids keeping a
+            // hand-maintained list of arming command names in sync here.
+            self.editor.clear_window_pick();
             let mut cx = crate::commands::Context {
                 editor: &mut self.editor,
                 count: None,

@@ -150,6 +150,19 @@ impl Compositor {
             }
         }
 
+        // An armed window picker resolves in EditorView — the BOTTOM layer. If
+        // an overlay (prompt, picker, popup) sits above it, that layer consumes
+        // the keypress first, and the pick would linger armed-but-unreachable
+        // with its labels painted underneath the overlay. The user is
+        // interacting with the overlay, so treat the key as a cancel and let
+        // the overlay handle it normally.
+        if matches!(event, Event::Key(_))
+            && self.layers.len() > 1
+            && cx.editor.pending_window_pick.is_some()
+        {
+            cx.editor.clear_window_pick();
+        }
+
         let mut callbacks = Vec::new();
         let mut consumed = false;
 
