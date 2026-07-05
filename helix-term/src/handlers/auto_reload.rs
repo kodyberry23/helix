@@ -40,7 +40,7 @@ impl ReloadHandler {
         let fs_events = event.fs_events.clone();
         if !fs_events
             .iter()
-            .any(|event| event.ty == EventType::Modified)
+            .any(|event| matches!(event.ty, EventType::Modified | EventType::Create))
         {
             return;
         }
@@ -49,10 +49,14 @@ impl ReloadHandler {
             let mut vcs_reload = false;
 
             for fs_event in &*fs_events {
+                // Renames (e.g. git committing a ref via <ref>.lock) surface as
+                // Create; those matter for the VCS state but not for buffers.
+                if matches!(fs_event.ty, EventType::Modified | EventType::Create) {
+                    vcs_reload |= editor.diff_providers.needs_reload(fs_event);
+                }
                 if fs_event.ty != EventType::Modified {
                     continue;
                 }
-                vcs_reload |= editor.diff_providers.needs_reload(fs_event);
 
                 let Some(doc_id) = editor.document_id_by_path(fs_event.path.as_std_path()) else {
                     continue;

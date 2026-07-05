@@ -128,9 +128,25 @@ impl DiffProvider {
             #[cfg(feature = "git")]
             DiffProvider::Git => {
                 let path = fs_event.path.as_std_path();
-                // Check for regular .git/HEAD
-                if path.ends_with(".git/HEAD") {
+                // Ref updates are committed by writing <ref>.lock and renaming
+                // it over the ref; the rename emits its own event, so lock-file
+                // churn can be dropped outright.
+                if path.extension().is_some_and(|ext| ext == "lock") {
+                    return false;
+                }
+                // HEAD moves on branch switch; loose refs, packed-refs and
+                // reftable move on commit/amend/reset/pull/gc. All of them can
+                // change the diff base without the working file changing.
+                if path.ends_with(".git/HEAD") || path.ends_with(".git/packed-refs") {
                     return true;
+                }
+                let mut after_git_dir = false;
+                for comp in path.components() {
+                    let comp = comp.as_os_str();
+                    if after_git_dir && (comp == "refs" || comp == "reftable") {
+                        return true;
+                    }
+                    after_git_dir = comp == ".git";
                 }
                 // Check for worktree HEAD at .git/worktrees/<name>/HEAD
                 if path.file_name().is_some_and(|f| f == "HEAD") {
