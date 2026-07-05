@@ -174,7 +174,7 @@ fn handle_document_change(
     let target_view_id = editor.get_synced_view_id(doc_id);
 
     let doc = doc_mut!(editor, &doc_id);
-    let Some(path) = doc.path().cloned() else {
+    let Some(path) = doc.path().map(std::path::Path::to_path_buf) else {
         return;
     };
 
