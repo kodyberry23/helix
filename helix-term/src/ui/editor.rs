@@ -1479,6 +1479,64 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
+                // Window picker resolves the next keypress itself: a matching
+                // label focuses that split and opens the pending file there;
+                // any other key just cancels. We consume the key so it never
+                // leaks into normal editing.
+                //
+                // In insert mode we do NOT hijack the key (it would silently
+                // swallow typed text): cancel the picker and let the key insert
+                // normally. The picker is a normal/select-mode interaction.
+                if cx.editor.pending_window_pick.is_some() {
+                    if cx.editor.mode() == Mode::Insert {
+                        cx.editor.clear_window_pick();
+                        // fall through to normal insert handling below
+                    } else {
+                        let pick = cx.editor.pending_window_pick.take().unwrap();
+                        // This keypress resolves the picker, so it supersedes any
+                        // in-flight jump-label (`gw`) selection that may have been
+                        // pending when the picker was armed (e.g. over the socket):
+                        // drop its `on_next_key` callback — which would otherwise
+                        // hijack the *next* keystroke — and clear its lingering
+                        // label overlays.
+                        self.on_next_key = None;
+                        self.pseudo_pending.clear();
+                        let view_docs: Vec<_> =
+                            cx.editor.tree.views().map(|(v, _)| (v.id, v.doc)).collect();
+                        for (vid, did) in view_docs {
+                            if let Some(doc) = cx.editor.documents.get_mut(&did) {
+                                doc.remove_jump_labels(vid);
+                            }
+                        }
+                        if let Some(ch) = key.char().filter(|_| key.modifiers.is_empty()) {
+                            // Labels render uppercase (nvim-tree style) but match
+                            // case-insensitively so a plain keypress resolves.
+                            if let Some((view_id, _, _)) = pick
+                                .labels
+                                .iter()
+                                .find(|(_, c, _)| c.eq_ignore_ascii_case(&ch))
+                            {
+                                let view_id = *view_id;
+                                // Guard against a label whose split was closed
+                                // (e.g. by another socket command) after arming:
+                                // focusing a dead ViewId panics. Treat as cancel.
+                                if cx.editor.tree.contains(view_id) {
+                                    cx.editor.focus(view_id);
+                                    // Picking always opens IN the chosen split;
+                                    // shared tail with the :open-family commands.
+                                    let _ = crate::commands::typed::open_and_align(
+                                        cx.editor,
+                                        &pick.path,
+                                        pick.pos,
+                                        helix_view::editor::Action::Replace,
+                                    );
+                                }
+                            }
+                        }
+                        return EventResult::Consumed(None);
+                    }
+                }
+
                 let mode = cx.editor.mode();
 
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
@@ -1577,7 +1635,18 @@ impl Component for EditorView {
                 EventResult::Consumed(callback)
             }
 
-            Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
+            Event::Mouse(event) => {
+                // A deliberate CLICK supersedes an armed window picker (which
+                // only resolves on a keypress); clear it so its labels don't
+                // linger out of sync with the focus the click moves. Passive
+                // events must NOT cancel: the terminal reports any-motion
+                // (DEC 1003), so plain mouse movement or a scroll would
+                // otherwise kill the picker before the user can press a label.
+                if matches!(event.kind, MouseEventKind::Down(_)) {
+                    cx.editor.clear_window_pick();
+                }
+                self.handle_mouse_event(event, &mut cx)
+            }
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
@@ -1629,6 +1698,33 @@ impl Component for EditorView {
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
+        }
+
+        // Window picker: when armed, draw each split's pre-rendered label
+        // (padded uppercase letter, built at arm time) centered in its
+        // statusline — nvim-tree centers its picker char the same way. Painted
+        // after the view loop so it sits on top of the statusline the view just
+        // rendered, and clipped to the view so a narrow split can't bleed into
+        // its neighbor. Resolved (case-insensitively) in `handle_event`.
+        if let Some(pick) = &cx.editor.pending_window_pick {
+            let style = cx.editor.theme.get("ui.virtual.jump-label");
+            for (view, _is_focused) in cx.editor.tree.views() {
+                if let Some((_, _, label)) = pick.labels.iter().find(|(id, _, _)| *id == view.id) {
+                    let label_width = label.chars().count() as u16;
+                    // Center the padded label; in a split too narrow for the
+                    // padding, fall back to the bare letter at the left edge.
+                    let (x, text) = if view.area.width >= label_width {
+                        (view.area.x + (view.area.width - label_width) / 2, &label[..])
+                    } else {
+                        (view.area.x, label.trim())
+                    };
+                    let y = view.area.y + view.area.height.saturating_sub(1);
+                    // Clip at the view's right edge (set_string only clips at
+                    // the buffer edge, which would paint into the next split).
+                    let max = (view.area.x + view.area.width).saturating_sub(x) as usize;
+                    surface.set_stringn(x, y, text, max, style);
+                }
+            }
         }
 
         if config.auto_info {

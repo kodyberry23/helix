@@ -10,6 +10,8 @@ pub mod events;
 pub mod health;
 pub mod job;
 pub mod keymap;
+#[cfg(unix)]
+pub mod sidebar_follow;
 pub mod ui;
 
 #[cfg(not(windows))]
