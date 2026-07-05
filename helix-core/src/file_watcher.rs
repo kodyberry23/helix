@@ -573,11 +573,17 @@ fn file_name(path: &Path) -> Option<&str> {
 }
 
 fn is_vcs_ignore(path: &Path, watch_vcs: bool) -> bool {
-    // ignore .git directory contents except .git/HEAD (and .git itself)
+    // Ignore .git directory contents except the files that signal a git
+    // state change: HEAD (branch switch), refs/** (commit/amend/reset/pull
+    // move the branch ref without touching HEAD), packed-refs and reftable
+    // (pack/gc). index and object churn stay ignored.
     // Note: only checks immediate parent; recursive checking is done by ignore_path_rec
     if watch_vcs
         && path.parent().is_some_and(|it| it.ends_with(".git"))
-        && !path.ends_with(".git/HEAD")
+        && !(path.ends_with(".git/HEAD")
+            || path.ends_with(".git/refs")
+            || path.ends_with(".git/packed-refs")
+            || path.ends_with(".git/reftable"))
     {
         return true;
     }
