@@ -65,11 +65,39 @@ pub fn format_relative_time(timestamp: i64, timezone_offset: i32) -> String {
     };
     let value = value.to_string();
 
-    let label = if time_passed.is_positive() {
-        "ago"
-    } else {
+    // A zero difference is "now", not the future: commit times are whole
+    // seconds, so a commit made in the current second lands here.
+    let label = if time_passed.is_negative() {
         "from now"
+    } else {
+        "ago"
     };
 
     format!("{value} {unit} {label}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unix_now() -> i64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn same_second_is_ago_not_from_now() {
+        // Whole-second timestamps mean "just committed" is a zero difference.
+        assert_eq!(format_relative_time(unix_now(), 0), "0 seconds ago");
+    }
+
+    #[test]
+    fn past_and_future() {
+        let now = unix_now();
+        assert_eq!(format_relative_time(now - 3 * DAY, 0), "3 days ago");
+        assert_eq!(format_relative_time(now + 2 * HOUR, 0), "2 hours from now");
+        assert_eq!(format_relative_time(now - YEAR, 0), "1 year ago");
+    }
 }
