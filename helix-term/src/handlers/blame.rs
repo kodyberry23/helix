@@ -208,6 +208,12 @@ impl DocQueue {
     }
 }
 
+/// Two sources of intent, oldest first: the line a request was sent with, and one
+/// asked for while it ran. The newest answers.
+fn line_to_answer(own: Option<u32>, deferred: Option<u32>) -> Option<u32> {
+    deferred.or(own)
+}
+
 /// What to do with a blame result once it reaches the editor
 #[derive(Debug, PartialEq, Eq)]
 enum Landing {
@@ -310,11 +316,9 @@ fn land(
     result: anyhow::Result<FileBlame>,
 ) {
     let auto_fetch = editor.config().inline_blame.auto_fetch;
-    // Two sources of intent, oldest first: the line this request was sent with, and
-    // one asked for while it ran. The newest answers.
     let own_line = line;
     let deferred_line = QUEUE.lock().take_deferred(doc_id);
-    let line = deferred_line.or(own_line);
+    let line = line_to_answer(own_line, deferred_line);
     let failure = result
         .as_ref()
         .err()
@@ -549,9 +553,22 @@ mod tests {
         assert_eq!(next.line, Some(9), "asked for later, so it wins");
     }
 
+    #[test]
+    fn the_line_asked_for_last_answers() {
+        assert_eq!(
+            line_to_answer(Some(2), Some(7)),
+            Some(7),
+            "deferred is newer"
+        );
+        assert_eq!(line_to_answer(Some(2), None), Some(2));
+        assert_eq!(line_to_answer(None, Some(7)), Some(7));
+        assert_eq!(line_to_answer(None, None), None);
+    }
+
     /// The handover a stale landing performs (`Landing::StoreAndWait`): the landing
     /// request's own line goes to the waiter, whose own line wins, while a line
-    /// deferred later than both stays deferred and beats either when the waiter lands.
+    /// deferred later than both is kept deferred, so `line_to_answer` picks it when
+    /// the waiter lands.
     #[test]
     fn handover_keeps_a_deferred_line_ahead_of_the_waiter() {
         let doc = DocumentId::default();
@@ -571,10 +588,12 @@ mod tests {
             Some(9),
             "the waiter's own line beats the older one"
         );
+        let deferred = queue.take_deferred(doc);
+        assert_eq!(deferred, Some(7), "the deferral survived the handover");
         assert_eq!(
-            queue.take_deferred(doc),
+            line_to_answer(next.line, deferred),
             Some(7),
-            "the line deferred last is still ahead of both"
+            "and answers ahead of the waiter's own line"
         );
     }
 
