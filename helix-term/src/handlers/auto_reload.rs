@@ -222,13 +222,7 @@ fn handle_document_change(
         }
     } else {
         // Per-document trust: each doc's workspace may differ.
-        let trust_full = editor
-            .workspace_trust
-            .query(
-                doc.workspace_root(),
-                helix_loader::workspace_trust::TrustQuery::Git,
-            )
-            .is_trusted();
+        let trust_full = crate::handlers::blame::git_trust_full(&editor.workspace_trust, doc);
         let view = view_mut!(editor, target_view_id);
         match doc.reload(view, &editor.diff_providers, trust_full) {
             Ok(_) => {
@@ -260,13 +254,7 @@ fn reload_vcs_diffs(editor: &mut Editor) {
             continue;
         };
         // Per-document trust: each doc's workspace may differ.
-        let trust_full = editor
-            .workspace_trust
-            .query(
-                doc.workspace_root(),
-                helix_loader::workspace_trust::TrustQuery::Git,
-            )
-            .is_trusted();
+        let trust_full = crate::handlers::blame::git_trust_full(&editor.workspace_trust, doc);
         match editor.diff_providers.get_diff_base(&path, trust_full) {
             Some(diff_base) => doc.set_diff_base(diff_base),
             None => doc.diff_handle = None,
@@ -282,6 +270,11 @@ fn reload_vcs_diffs(editor: &mut Editor) {
             doc.is_blame_potentially_out_of_date = true;
         }
     }
+    // HEAD may now name another branch: re-resolve the paths polled outside the
+    // workspace so commits on it are seen too.
+    let (workspace, _) = helix_loader::find_workspace();
+    let extra_paths = editor.diff_providers.get_watched_paths(&workspace);
+    editor.file_watcher.set_extra_watched_paths(extra_paths);
 }
 
 /// Shows a prompt asking the user whether to reload a modified document.
@@ -300,14 +293,7 @@ fn prompt_reload_modified(compositor: &mut Compositor, doc_id: DocumentId, path_
                     let target_view_id = cx.editor.get_synced_view_id(doc_id);
                     let doc = doc_mut!(cx.editor, &doc_id);
                     // Per-document trust: each doc's workspace may differ.
-                    let trust_full = cx
-                        .editor
-                        .workspace_trust
-                        .query(
-                            doc.workspace_root(),
-                            helix_loader::workspace_trust::TrustQuery::Git,
-                        )
-                        .is_trusted();
+                    let trust_full = crate::handlers::blame::git_trust_full(&cx.editor.workspace_trust, doc);
                     let view = view_mut!(cx.editor, target_view_id);
                     match doc.reload(view, &cx.editor.diff_providers, trust_full) {
                         Ok(_) => {

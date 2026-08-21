@@ -1524,7 +1524,7 @@ impl Editor {
 
         // Initialize file watcher and diff providers
         let mut file_watcher = Watcher::new(&conf.file_watcher);
-        let diff_providers = DiffProviderRegistry::default();
+        let mut diff_providers = DiffProviderRegistry::default();
 
         // Set up extra watched paths from VCS providers (e.g., external HEAD files for worktrees)
         let (workspace, _) = helix_loader::find_workspace();

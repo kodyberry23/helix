@@ -163,16 +163,26 @@ fn symlink_to_git_repo() {
 
 /// A linked worktree only owns its HEAD; commits on its branch move a ref in the
 /// main repository's git dir, which is outside the worktree's workspace and must
-/// be polled explicitly.
+/// be polled explicitly. (For a regular repository the same paths are reported and
+/// the file watcher drops them as already covered.)
 #[test]
 fn watch_paths_cover_the_linked_worktree_branch() {
     let repo = empty_git_repo();
     File::create(repo.path().join("file.txt")).unwrap();
     create_commit(repo.path(), true);
 
-    let main_paths = git::get_watch_paths(repo.path());
-    assert_eq!(main_paths.len(), 1, "{main_paths:?}");
-    assert!(main_paths[0].ends_with(".git/HEAD"), "{main_paths:?}");
+    let mut main_paths: Vec<String> = git::get_watch_paths(repo.path())
+        .iter()
+        .map(|p| {
+            let s = p.to_string_lossy();
+            s[s.find(".git").unwrap()..].to_string()
+        })
+        .collect();
+    main_paths.sort();
+    assert_eq!(
+        main_paths,
+        vec![".git/HEAD", ".git/packed-refs", ".git/refs/heads/main"]
+    );
 
     let worktrees = tempfile::tempdir().unwrap();
     let worktree = worktrees.path().join("wt");

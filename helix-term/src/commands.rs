@@ -3703,10 +3703,9 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
     };
     let current = doc.blame_is_current();
     let (needs_fetch, outcome) = match doc.line_blame(cursor_line, &inline_blame_config.format) {
-        Ok(blame) => (
-            doc.is_blame_potentially_out_of_date && !current,
-            Outcome::Blame(blame),
-        ),
+        // Whatever set (or failed to set) the out-of-date flag, a blame that no
+        // longer matches HEAD is not the answer.
+        Ok(blame) => (!current, Outcome::Blame(blame)),
         Err(err @ LineBlameError::NotReadyYet) => (
             !inline_blame_config.auto_fetch,
             Outcome::Status(err.to_string()),
@@ -3736,7 +3735,8 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
                 editor.set_error("Could not get path of document");
                 return;
             }
-            Err(NotRequested::Current) => unreachable!("forced requests are always sent"),
+            // Cannot happen for a forced request; showing what we have is the safe fallback.
+            Err(NotRequested::Current) => {}
         }
     }
 

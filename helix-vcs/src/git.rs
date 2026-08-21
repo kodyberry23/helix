@@ -102,9 +102,11 @@ pub fn for_each_changed_file(
 
 /// Get the path to the HEAD file for the git repository containing the given path.
 /// This properly handles both regular repositories and worktrees.
-/// Paths whose change means the repository's history may have moved, for polling
-/// when they lie outside the watched workspace. Missing paths are fine: they poll
-/// as absent and fire when they appear.
+/// Paths whose change means `HEAD` may have moved: the `HEAD` file, the branch it
+/// names and `packed-refs`. They are polled when they lie outside the watched
+/// workspace (the main repository of a linked worktree, a submodule's git dir under
+/// the superproject); the file watcher drops the ones inside it. Missing paths are
+/// fine: they poll as absent and fire when they appear.
 pub fn get_watch_paths(path: &Path) -> Vec<PathBuf> {
     // Locating these files only reads the repository's directory layout, never
     // repository-local config, so Reduced trust is always sufficient here.
@@ -112,20 +114,16 @@ pub fn get_watch_paths(path: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let repo = repo.to_thread_local();
-    // For regular repos: /path/to/repo/.git. For linked worktrees:
-    // /path/to/main/.git/worktrees/<name>, whose HEAD is all that is private to
-    // the worktree; its branch and packed refs live in the main repository's
-    // git dir.
-    let git_dir = repo.git_dir();
-    // gix hands back the `commondir` file verbatim (`<git_dir>/../..`), so
-    // normalize before comparing and joining.
+    // git_dir: `.git` for a regular repo, `<main>/.git/worktrees/<name>` for a linked
+    // worktree (whose HEAD is all that is private to it). common_dir: where refs and
+    // packed-refs live; gix hands back the `commondir` file verbatim (`../..`), so
+    // normalize before joining.
     let common_dir = helix_stdx::path::normalize(repo.common_dir());
-    let mut paths = vec![git_dir.join("HEAD")];
-    if git_dir != common_dir.as_path() {
-        paths.push(common_dir.join("packed-refs"));
-        if let Ok(Some(branch)) = repo.head_ref() {
-            paths.push(common_dir.join(gix::path::from_bstr(branch.name().as_bstr())));
-        }
+    let mut paths = vec![repo.git_dir().join("HEAD"), common_dir.join("packed-refs")];
+    // `head_name` (not `head_ref`) also names an unborn branch, which the first
+    // commit will create.
+    if let Ok(Some(branch)) = repo.head_name() {
+        paths.push(common_dir.join(gix::path::from_bstr(branch.as_bstr())));
     }
     paths
 }

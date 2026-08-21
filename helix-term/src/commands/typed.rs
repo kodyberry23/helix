@@ -1758,14 +1758,7 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         view.sync_changes(doc);
 
         // Per-document trust: each doc's workspace may differ.
-        let trust_full = cx
-            .editor
-            .workspace_trust
-            .query(
-                doc.workspace_root(),
-                helix_loader::workspace_trust::TrustQuery::Git,
-            )
-            .is_trusted();
+        let trust_full = crate::handlers::blame::git_trust_full(&cx.editor.workspace_trust, doc);
         if let Err(error) = doc.reload(view, &cx.editor.diff_providers, trust_full) {
             cx.editor.set_error(format!("{}", error));
             continue;
@@ -4713,13 +4706,7 @@ fn current_workspace(cx: &compositor::Context) -> std::path::PathBuf {
 /// `Trust::Full`).
 fn doc_trust_full(editor: &helix_view::Editor) -> bool {
     let (_, doc) = current_ref!(editor);
-    editor
-        .workspace_trust
-        .query(
-            doc.workspace_root(),
-            helix_loader::workspace_trust::TrustQuery::Git,
-        )
-        .is_trusted()
+    crate::handlers::blame::git_trust_full(&editor.workspace_trust, doc)
 }
 
 fn trust_workspace(

@@ -27,6 +27,11 @@ pub use status::FileChange;
 #[derive(Clone, Debug)]
 pub struct DiffProviderRegistry {
     providers: Vec<DiffProvider>,
+    /// Paths outside the workspace that the file watcher polls on this registry's
+    /// behalf (see [`Self::get_watched_paths`]). An event for one of them is a VCS
+    /// change whatever the repository layout (`.git` directory, bare main repository
+    /// of a linked worktree, submodule git dir).
+    polled: Vec<PathBuf>,
 }
 
 impl DiffProviderRegistry {
@@ -64,19 +69,24 @@ impl DiffProviderRegistry {
     }
 
     pub fn needs_reload(&self, fs_event: &helix_core::file_watcher::Event) -> bool {
-        self.providers
-            .iter()
-            .any(|provider| provider.needs_reload(fs_event))
+        let path = fs_event.path.as_std_path();
+        self.polled.iter().any(|polled| polled == path)
+            || self
+                .providers
+                .iter()
+                .any(|provider| provider.needs_reload(fs_event))
     }
 
     /// Get paths that need to be watched for VCS state changes.
     /// These are paths like HEAD files that indicate branch/commit changes.
     /// The workspace path is used to determine if the VCS metadata is external.
-    pub fn get_watched_paths(&self, workspace: &Path) -> Vec<PathBuf> {
-        self.providers
+    pub fn get_watched_paths(&mut self, workspace: &Path) -> Vec<PathBuf> {
+        self.polled = self
+            .providers
             .iter()
             .flat_map(|provider| provider.get_watched_paths(workspace))
-            .collect()
+            .collect();
+        self.polled.clone()
     }
 
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
@@ -109,7 +119,10 @@ impl Default for DiffProviderRegistry {
             DiffProvider::Git,
             DiffProvider::None,
         ];
-        DiffProviderRegistry { providers }
+        DiffProviderRegistry {
+            providers,
+            polled: Vec::new(),
+        }
     }
 }
 
@@ -235,6 +248,26 @@ mod tests {
             ty: EventType::Modified,
         };
         assert!(!provider.needs_reload(&event));
+    }
+
+    #[cfg(feature = "git")]
+    #[test]
+    fn test_needs_reload_polled_paths_in_any_layout() {
+        use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
+        use std::path::{Path, PathBuf};
+
+        let event = |path: &str| Event {
+            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            ty: EventType::Modified,
+        };
+        // A bare main repository is not called `.git`, so the path shape alone does
+        // not classify it; being a polled path does.
+        let bare_head = "/srv/repo.git/worktrees/wt/HEAD";
+        let mut registry = DiffProviderRegistry::default();
+        assert!(!registry.needs_reload(&event(bare_head)));
+        registry.polled = vec![PathBuf::from(bare_head)];
+        assert!(registry.needs_reload(&event(bare_head)));
+        assert!(!registry.needs_reload(&event("/srv/repo.git/worktrees/wt/index")));
     }
 
     #[cfg(feature = "git")]
