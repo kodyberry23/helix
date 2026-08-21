@@ -225,21 +225,7 @@ impl Watcher {
         // The paths arrive canonical; compare against the canonical workspace.
         let workspace = workspace.canonicalize().unwrap_or(workspace);
         let previous = std::mem::take(&mut self.extra_watched_paths);
-        self.extra_watched_paths = paths
-            .into_iter()
-            .filter(|path| !path.starts_with(&workspace))
-            .map(|path| {
-                // Keep the baseline of a path already tracked, and give a path new
-                // to the set none at all: its first poll then reports it changed,
-                // one cheap VCS refresh that guarantees nothing which happened while
-                // the set was being re-resolved is absorbed.
-                let mtime = previous
-                    .iter()
-                    .find(|(known, _)| *known == path)
-                    .and_then(|(_, mtime)| *mtime);
-                (path, mtime)
-            })
-            .collect();
+        self.extra_watched_paths = seed_extra_watched_paths(&previous, paths, &workspace);
         if !self.extra_watched_paths.is_empty() {
             log::debug!(
                 "added {} extra paths for polling: {:?}",
@@ -604,11 +590,89 @@ fn is_vcs_ignore(path: &Path, watch_vcs: bool) -> bool {
     }
 }
 
+/// Baselines for the polled paths outside `workspace` (the ones inside are covered
+/// by the watcher). The first time the set is built every path gets its current
+/// mtime. On a re-resolution a path already tracked keeps its baseline, and a path
+/// new to the set gets none at all: its first poll then reports it changed, one
+/// cheap VCS refresh that guarantees nothing which happened while the set was being
+/// re-resolved is absorbed.
+fn seed_extra_watched_paths(
+    previous: &[(PathBuf, Option<SystemTime>)],
+    paths: Vec<PathBuf>,
+    workspace: &Path,
+) -> Vec<(PathBuf, Option<SystemTime>)> {
+    let initial = previous.is_empty();
+    paths
+        .into_iter()
+        .filter(|path| !path.starts_with(workspace))
+        .map(|path| {
+            let mtime = match previous.iter().find(|(known, _)| *known == path) {
+                Some((_, mtime)) => *mtime,
+                None if initial => path.metadata().ok().and_then(|m| m.modified().ok()),
+                None => None,
+            };
+            (path, mtime)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use crate::file_watcher::{is_hardcoded_whitelist, is_hidden, is_vcs_ignore};
+
+    #[test]
+    fn extra_watched_path_baselines() {
+        use super::seed_extra_watched_paths;
+        use std::time::SystemTime;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hx-watch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("HEAD");
+        std::fs::write(&existing, "ref: refs/heads/main\n").unwrap();
+        let missing = dir.join("refs").join("heads").join("unborn");
+        let inside = dir.join("workspace").join(".git").join("HEAD");
+
+        // Initial set: real baselines, paths inside the workspace dropped.
+        let seeded = seed_extra_watched_paths(
+            &[],
+            vec![existing.clone(), missing.clone(), inside],
+            &dir.join("workspace"),
+        );
+        assert_eq!(seeded.len(), 2);
+        assert!(
+            seeded[0].1.is_some(),
+            "an existing path starts at its mtime"
+        );
+        assert!(seeded[1].1.is_none(), "a missing path has no mtime yet");
+
+        // Re-resolution: tracked paths keep their baseline, new ones start unknown.
+        let old_mtime = seeded[0].1;
+        let new_branch = dir.join("refs").join("heads").join("feature");
+        std::fs::create_dir_all(new_branch.parent().unwrap()).unwrap();
+        std::fs::write(&new_branch, "0000\n").unwrap();
+        let reseeded = seed_extra_watched_paths(
+            &seeded,
+            vec![existing.clone(), new_branch.clone()],
+            &dir.join("workspace"),
+        );
+        assert_eq!(reseeded.len(), 2);
+        assert_eq!(reseeded[0], (existing, old_mtime));
+        assert_eq!(
+            reseeded[1],
+            (new_branch, None),
+            "a path new to a re-resolved set fires on its first poll"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_vcs_ignore() {

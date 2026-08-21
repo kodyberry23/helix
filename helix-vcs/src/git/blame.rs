@@ -20,6 +20,10 @@ enum LineBlameUnit {
     Processed(LineBlame),
 }
 
+/// A commit `HEAD` pointed at, as seen by [`FileBlame`]; opaque to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadId(gix::ObjectId);
+
 /// Stores information about the blame for a file
 #[derive(Debug)]
 pub struct FileBlame {
@@ -93,6 +97,18 @@ impl FileBlame {
     }
 
     /// Compute blame for this file (expensive)
+    /// The `HEAD` this blame was computed against
+    pub fn head(&self) -> HeadId {
+        HeadId(self.head)
+    }
+
+    /// The repository's `HEAD` right now, if it can be read. Read it once and judge
+    /// several blames against it with [`Self::head`] when they must agree.
+    pub fn repository_head(&self) -> Option<HeadId> {
+        let repo = self.repo.to_thread_local();
+        repo.head_id().ok().map(|id| HeadId(id.detach()))
+    }
+
     /// Whether this blame was computed against the repository's current `HEAD`.
     ///
     /// Blame maps lines to commits as of one `HEAD`; once `HEAD` moves (commit, amend,
@@ -103,8 +119,7 @@ impl FileBlame {
     /// Object replacements (`git replace`) are not part of this: gix does not apply
     /// them when reading objects, so neither the blame nor the diff base ever see them.
     pub fn is_current(&self) -> bool {
-        let repo = self.repo.to_thread_local();
-        repo.head_id().is_ok_and(|id| id.detach() == self.head)
+        self.repository_head() == Some(self.head())
     }
 
     pub fn try_new(file: PathBuf, trust_full: bool) -> Result<Self> {

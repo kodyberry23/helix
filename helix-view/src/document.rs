@@ -816,8 +816,20 @@ impl Document {
     /// The blame this document holds, relative to the repository's current `HEAD`.
     /// See [`helix_vcs::FileBlame::is_current`].
     pub fn held_blame(&self) -> HeldBlame {
+        let head = self
+            .file_blame
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(helix_vcs::FileBlame::repository_head);
+        self.held_blame_at(head)
+    }
+
+    /// Like [`Self::held_blame`], judged against a `HEAD` the caller read, so that
+    /// several blames can be judged at one instant. `None` (unreadable `HEAD`) counts
+    /// as stale.
+    pub fn held_blame_at(&self, head: Option<helix_vcs::HeadId>) -> HeldBlame {
         match &self.file_blame {
-            Some(Ok(blame)) if blame.is_current() => HeldBlame::Current,
+            Some(Ok(blame)) if head == Some(blame.head()) => HeldBlame::Current,
             Some(Ok(_)) => HeldBlame::Stale,
             _ => HeldBlame::Nothing,
         }

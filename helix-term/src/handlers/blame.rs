@@ -181,6 +181,25 @@ impl DocQueue {
         }
     }
 
+    /// Hand `line` to the request waiting for `doc_id`, which will land after the
+    /// current one; its own line, asked for later, takes precedence.
+    fn carry_to_waiter(&mut self, doc_id: DocumentId, line: Option<u32>) {
+        match self
+            .running
+            .get_mut(&doc_id)
+            .and_then(|running| running.waiting.as_mut())
+        {
+            Some(waiting) => waiting.line = waiting.line.or(line),
+            None => self.defer_answer(doc_id, line),
+        }
+    }
+
+    /// `doc_id` no longer exists: drop whatever was queued or deferred for it.
+    fn abandon(&mut self, doc_id: DocumentId) {
+        self.running.remove(&doc_id);
+        self.deferred_lines.remove(&doc_id);
+    }
+
     /// The line to answer as a result lands. A deferred line was asked for after
     /// the landing request was sent, so it is the newer intent and wins.
     fn take_answer(&mut self, doc_id: DocumentId, line: Option<u32>) -> Option<u32> {
@@ -295,27 +314,41 @@ fn land(
         .as_ref()
         .err()
         .map(|err| format!("Blame failed: {err:#}"));
-    let outcome = editor.document_mut(doc_id).map(|doc| {
-        let held = doc.held_blame();
-        let result_current = result.as_ref().ok().map(FileBlame::is_current);
-        let superseded = QUEUE.lock().superseded(doc_id, epoch);
-        let landing = landing(result_current, held, superseded);
-        if landing != Landing::Discard {
-            doc.file_blame = Some(result);
-        }
-        (landing, held)
-    });
+    let Some(doc) = editor.document_mut(doc_id) else {
+        // The document was closed meanwhile: nothing queued for it is worth computing.
+        QUEUE.lock().abandon(doc_id);
+        return;
+    };
+    // One HEAD read serves both judgements, so they cannot disagree about "now".
+    let head_now = result
+        .as_ref()
+        .ok()
+        .or_else(|| doc.file_blame.as_ref().and_then(|held| held.as_ref().ok()))
+        .and_then(FileBlame::repository_head);
+    let held = doc.held_blame_at(head_now);
+    let result_current = result
+        .as_ref()
+        .ok()
+        .map(|blame| head_now == Some(blame.head()));
+    let superseded = QUEUE.lock().superseded(doc_id, epoch);
+    let landing = landing(result_current, held, superseded);
+    if landing != Landing::Discard {
+        doc.file_blame = Some(result);
+    }
     // This computation is over: start the request that waited behind it, if any.
     // Done here, after the result is in the document, so the queue never claims a
-    // blame is in flight once its result has landed, nor the reverse.
-    let next = QUEUE.lock().finished(doc_id);
+    // blame is in flight once its result has landed, nor the reverse. A waiter
+    // inherits the line this result could not answer.
+    let next = {
+        let mut queue = QUEUE.lock();
+        if landing == Landing::StoreAndWait {
+            queue.carry_to_waiter(doc_id, line);
+        }
+        queue.finished(doc_id)
+    };
     if let Some((next, epoch)) = next {
         spawn_blame(next, epoch);
     }
-    let Some((landing, held)) = outcome else {
-        // The document was closed meanwhile; the deferred line went with it.
-        return;
-    };
     match landing {
         Landing::Store => {
             if let (Some(failure), None, true) = (&failure, line, auto_fetch) {
@@ -341,17 +374,17 @@ fn land(
                 }
             }
         }
-        Landing::StoreAndWait => {
-            QUEUE.lock().defer_answer(doc_id, line);
-            return;
-        }
+        Landing::StoreAndWait => return,
         Landing::StoreAndRefetch => {
-            QUEUE.lock().defer_answer(doc_id, line);
+            // The fresh request carries the line, so a later `blame_line` merging
+            // into it still wins. If nothing is sent (HEAD moved back, so what we
+            // hold is current after all), answer from it below.
             if let Some(doc) = editor.document(doc_id) {
                 let trust_full = git_trust_full(&editor.workspace_trust, doc);
-                let _ = request_blame(&editor.handlers, doc, trust_full, None);
+                if request_blame(&editor.handlers, doc, trust_full, line).is_ok() {
+                    return;
+                }
             }
-            return;
         }
     }
     // Answer from whatever blame the document holds now.
@@ -483,6 +516,46 @@ mod tests {
             "consumed: own line again"
         );
         assert_eq!(queue.take_answer(doc, None), None, "nothing left");
+    }
+
+    #[test]
+    fn a_waiter_inherits_the_line_it_must_answer_but_its_own_wins() {
+        let doc = DocumentId::default();
+        let mut queue = DocQueue::default();
+        queue.submit(request(None)).expect("starts");
+        queue.carry_to_waiter(doc, Some(4));
+        assert_eq!(
+            queue.take_answer(doc, None),
+            Some(4),
+            "no waiter: the line is deferred to the next landing"
+        );
+        assert!(
+            queue.submit(request(None)).is_none(),
+            "waiter without a line"
+        );
+        queue.carry_to_waiter(doc, Some(4));
+        let (next, _) = queue.finished(doc).unwrap();
+        assert_eq!(next.line, Some(4), "the waiter inherited the line");
+        assert!(
+            queue.submit(request(Some(9))).is_none(),
+            "waiter with its own line"
+        );
+        queue.carry_to_waiter(doc, Some(4));
+        let (next, _) = queue.finished(doc).unwrap();
+        assert_eq!(next.line, Some(9), "asked for later, so it wins");
+    }
+
+    #[test]
+    fn abandoning_a_document_drops_its_waiter_and_deferred_line() {
+        let doc = DocumentId::default();
+        let mut queue = DocQueue::default();
+        queue.submit(request(None)).expect("starts");
+        assert!(queue.submit(request(Some(3))).is_none(), "waits");
+        queue.defer_answer(doc, Some(5));
+        queue.abandon(doc);
+        assert!(!queue.in_flight(doc));
+        assert!(queue.finished(doc).is_none(), "nothing is promoted");
+        assert_eq!(queue.take_answer(doc, None), None);
     }
 
     #[test]
