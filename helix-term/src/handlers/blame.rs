@@ -200,10 +200,11 @@ impl DocQueue {
         self.deferred_lines.remove(&doc_id);
     }
 
-    /// The line to answer as a result lands. A deferred line was asked for after
-    /// the landing request was sent, so it is the newer intent and wins.
-    fn take_answer(&mut self, doc_id: DocumentId, line: Option<u32>) -> Option<u32> {
-        self.deferred_lines.remove(&doc_id).or(line)
+    /// The line deferred to the next landing for `doc_id`, if any. It was asked for
+    /// after the landing request was sent, so it is newer than that request's own
+    /// line and wins over it.
+    fn take_deferred(&mut self, doc_id: DocumentId) -> Option<u32> {
+        self.deferred_lines.remove(&doc_id)
     }
 }
 
@@ -309,7 +310,11 @@ fn land(
     result: anyhow::Result<FileBlame>,
 ) {
     let auto_fetch = editor.config().inline_blame.auto_fetch;
-    let line = QUEUE.lock().take_answer(doc_id, line);
+    // Two sources of intent, oldest first: the line this request was sent with, and
+    // one asked for while it ran. The newest answers.
+    let own_line = line;
+    let deferred_line = QUEUE.lock().take_deferred(doc_id);
+    let line = deferred_line.or(own_line);
     let failure = result
         .as_ref()
         .err()
@@ -337,12 +342,15 @@ fn land(
     }
     // This computation is over: start the request that waited behind it, if any.
     // Done here, after the result is in the document, so the queue never claims a
-    // blame is in flight once its result has landed, nor the reverse. A waiter
-    // inherits the line this result could not answer.
+    // blame is in flight once its result has landed, nor the reverse. When the
+    // waiter is to answer, it inherits this request's own line (its own, sent
+    // later, takes precedence) while a line deferred later than both stays
+    // deferred and beats either at the waiter's landing.
     let next = {
         let mut queue = QUEUE.lock();
         if landing == Landing::StoreAndWait {
-            queue.carry_to_waiter(doc_id, line);
+            queue.carry_to_waiter(doc_id, own_line);
+            queue.defer_answer(doc_id, deferred_line);
         }
         queue.finished(doc_id)
     };
@@ -498,24 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn deferred_lines_are_answered_by_the_next_landing_and_win() {
+    fn deferred_lines_are_taken_once() {
         let doc = DocumentId::default();
         let mut queue = DocQueue::default();
-        assert_eq!(queue.take_answer(doc, None), None);
+        assert_eq!(queue.take_deferred(doc), None);
         queue.defer_answer(doc, None);
-        assert_eq!(queue.take_answer(doc, None), None, "nothing to defer");
+        assert_eq!(queue.take_deferred(doc), None, "nothing to defer");
         queue.defer_answer(doc, Some(7));
+        queue.defer_answer(doc, Some(8));
         assert_eq!(
-            queue.take_answer(doc, Some(2)),
-            Some(7),
-            "the deferred line was asked for later, so it is what the user wants"
+            queue.take_deferred(doc),
+            Some(8),
+            "the latest deferral wins"
         );
-        assert_eq!(
-            queue.take_answer(doc, Some(2)),
-            Some(2),
-            "consumed: own line again"
-        );
-        assert_eq!(queue.take_answer(doc, None), None, "nothing left");
+        assert_eq!(queue.take_deferred(doc), None, "consumed");
     }
 
     #[test]
@@ -525,7 +529,7 @@ mod tests {
         queue.submit(request(None)).expect("starts");
         queue.carry_to_waiter(doc, Some(4));
         assert_eq!(
-            queue.take_answer(doc, None),
+            queue.take_deferred(doc),
             Some(4),
             "no waiter: the line is deferred to the next landing"
         );
@@ -555,7 +559,7 @@ mod tests {
         queue.abandon(doc);
         assert!(!queue.in_flight(doc));
         assert!(queue.finished(doc).is_none(), "nothing is promoted");
-        assert_eq!(queue.take_answer(doc, None), None);
+        assert_eq!(queue.take_deferred(doc), None);
     }
 
     #[test]

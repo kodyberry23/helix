@@ -96,7 +96,6 @@ impl FileBlame {
         line_blame
     }
 
-    /// Compute blame for this file (expensive)
     /// The `HEAD` this blame was computed against
     pub fn head(&self) -> HeadId {
         HeadId(self.head)
@@ -122,6 +121,7 @@ impl FileBlame {
         self.repository_head() == Some(self.head())
     }
 
+    /// Compute blame for this file (expensive)
     pub fn try_new(file: PathBuf, trust_full: bool) -> Result<Self> {
         let (file, thread_safe_repo) = open_repo_for_file(&file, trust_full)?;
         let repo = thread_safe_repo.to_thread_local();
