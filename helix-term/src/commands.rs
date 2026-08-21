@@ -3689,7 +3689,7 @@ fn insert_at_line_start(cx: &mut Context) {
 }
 
 pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_line: u32) {
-    use crate::handlers::blame::{request_blame, NotRequested};
+    use crate::handlers::blame::{git_trust_full, request_blame, NotRequested};
 
     enum Outcome {
         Blame(String),
@@ -3701,9 +3701,10 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
     let Some(doc) = editor.document(doc_id) else {
         return;
     };
+    let current = doc.blame_is_current();
     let (needs_fetch, outcome) = match doc.line_blame(cursor_line, &inline_blame_config.format) {
         Ok(blame) => (
-            doc.is_blame_potentially_out_of_date && !doc.blame_is_current(),
+            doc.is_blame_potentially_out_of_date && !current,
             Outcome::Blame(blame),
         ),
         Err(err @ LineBlameError::NotReadyYet) => (
@@ -3715,13 +3716,9 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
     };
 
     if needs_fetch {
-        match request_blame(
-            &editor.handlers,
-            &editor.workspace_trust,
-            doc,
-            Some(cursor_line),
-            false,
-        ) {
+        let trust_full = git_trust_full(&editor.workspace_trust, doc);
+        // Decided above, so `request_blame` must not second-guess it.
+        match request_blame(&editor.handlers, doc, trust_full, Some(cursor_line), true) {
             Ok(()) => {
                 let path = doc
                     .path()
@@ -3739,13 +3736,13 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
                 editor.set_error("Could not get path of document");
                 return;
             }
-            // HEAD has not moved since the blame was computed: it is still right.
-            Err(NotRequested::Current) => {}
+            Err(NotRequested::Current) => unreachable!("forced requests are always sent"),
         }
     }
 
-    if let Some(doc) = editor.document_mut(doc_id) {
-        if doc.is_blame_potentially_out_of_date && doc.blame_is_current() {
+    if current {
+        if let Some(doc) = editor.document_mut(doc_id) {
+            // History has not moved since the blame was computed: it is still right.
             doc.is_blame_potentially_out_of_date = false;
         }
     }

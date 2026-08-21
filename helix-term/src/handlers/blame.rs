@@ -25,26 +25,33 @@ static BLAME_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
     Semaphore::new((cores / 2).max(1))
 });
 
+/// Whether git may be run with full trust for `doc`'s workspace
+pub fn git_trust_full(workspace_trust: &WorkspaceTrust, doc: &Document) -> bool {
+    workspace_trust
+        .query(doc.workspace_root(), TrustQuery::Git)
+        .is_trusted()
+}
+
 /// Why [`request_blame`] sent nothing
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotRequested {
     /// The document has no path, so there is nothing to blame
     NoPath,
-    /// The blame the document holds was computed against the current `HEAD`
+    /// The blame the document holds was computed from the current history
     Current,
 }
 
 /// Ask for `doc`'s blame.
 ///
 /// Every source of blame requests goes through here so the decision to skip work is
-/// made in one place: a blame already computed against the current `HEAD` is kept,
-/// unless `force` is set because history was rewritten at the same `HEAD` (`git
-/// replace`). `line` asks for that line's blame to be shown in the statusline when
-/// the result lands, which is how `blame_line` works with auto-fetch off.
+/// made in one place: a blame computed from the current history (`HEAD` and the
+/// object replacements in effect) is kept unless `force` is set by a caller that has
+/// already decided. `line` asks for that line's blame to be shown in the statusline
+/// when the result lands, which is how `blame_line` works with auto-fetch off.
 pub fn request_blame(
     handlers: &Handlers,
-    workspace_trust: &WorkspaceTrust,
     doc: &Document,
+    trust_full: bool,
     line: Option<u32>,
     force: bool,
 ) -> Result<(), NotRequested> {
@@ -54,9 +61,6 @@ pub fn request_blame(
     if !force && doc.blame_is_current() {
         return Err(NotRequested::Current);
     }
-    let trust_full = workspace_trust
-        .query(doc.workspace_root(), TrustQuery::Git)
-        .is_trusted();
     helix_event::send_blocking(
         &handlers.blame,
         BlameEvent {
@@ -69,14 +73,22 @@ pub fn request_blame(
     Ok(())
 }
 
+/// `newer` supersedes `older` for the same document. The only field that carries
+/// user intent is `line` (show this line once the blame lands), so a later
+/// request without one must not drop it.
+fn merge_requests(older: &BlameEvent, mut newer: BlameEvent) -> BlameEvent {
+    newer.line = newer.line.or(older.line);
+    newer
+}
+
 /// Per-document sequencing of blame computations, shared between the hook and
 /// the tasks it spawns.
 ///
 /// One blame runs at a time per document and results land in the order they were
-/// requested, so a result computed against an older `HEAD` can never overwrite a
-/// newer one. A request that arrives while a blame for its document is running
-/// waits in a single slot and replaces whatever was waiting there: only the newest
-/// request matters, and no work in progress is thrown away.
+/// requested, so a result computed from older history can never overwrite a newer
+/// one. A request that arrives while a blame for its document is running waits in
+/// a single slot and replaces whatever was waiting there: only the newest request
+/// matters, and no work in progress is thrown away.
 #[derive(Default)]
 struct DocQueue {
     /// Documents with a blame running right now, each with at most one request
@@ -90,7 +102,11 @@ impl DocQueue {
     fn submit(&mut self, event: BlameEvent) -> Option<BlameEvent> {
         match self.running.entry(event.doc_id) {
             Entry::Occupied(mut slot) => {
-                *slot.get_mut() = Some(event);
+                let waiting = slot.get_mut();
+                *waiting = Some(match waiting.take() {
+                    Some(older) => merge_requests(&older, event),
+                    None => event,
+                });
                 None
             }
             Entry::Vacant(slot) => {
@@ -130,13 +146,19 @@ impl AsyncHook for BlameHandler {
         event: Self::Event,
         _timeout: Option<tokio::time::Instant>,
     ) -> Option<tokio::time::Instant> {
+        let event = match self.pending.get(&event.doc_id) {
+            Some(older) => merge_requests(older, event),
+            None => event,
+        };
         self.pending.insert(event.doc_id, event);
         Some(Instant::now() + Duration::from_millis(50))
     }
 
     fn finish_debounce(&mut self) {
         for (_, event) in self.pending.drain() {
-            if let Some(event) = self.queue.lock().submit(event) {
+            // Bound before the `if`, so the lock is not held while spawning.
+            let started = self.queue.lock().submit(event);
+            if let Some(event) = started {
                 spawn_blame(Arc::clone(&self.queue), event);
             }
         }
@@ -165,11 +187,26 @@ fn spawn_blame(queue: Arc<Mutex<DocQueue>>, event: BlameEvent) {
             Err(_) => Err(anyhow::anyhow!("blame queue closed")),
         };
         job::dispatch(move |editor, _| {
+            let auto_fetch = editor.config().inline_blame.auto_fetch;
             let Some(doc) = editor.document_mut(doc_id) else {
                 return;
             };
+            // History moved on while this blame ran (a rebase or checkout, possibly
+            // undone since). A blame that is still current beats one that never was;
+            // otherwise keep this one for now and compute a fresh one.
+            let stale = matches!(&result, Ok(blame) if !blame.is_current());
+            if stale && doc.blame_is_current() {
+                return;
+            }
             doc.file_blame = Some(result);
-            if !editor.config().inline_blame.auto_fetch {
+            if stale {
+                if let Some(doc) = editor.document(doc_id) {
+                    let trust_full = git_trust_full(&editor.workspace_trust, doc);
+                    let _ = request_blame(&editor.handlers, doc, trust_full, line, true);
+                }
+                return;
+            }
+            if !auto_fetch {
                 if let Some(line) = line {
                     crate::commands::blame_line_impl(editor, doc_id, line);
                 } else {
@@ -190,13 +227,8 @@ pub(super) fn register_hooks(_handlers: &Handlers) {
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         if event.editor.config().inline_blame.auto_fetch {
             if let Some(doc) = event.editor.document(event.doc) {
-                let _ = request_blame(
-                    &event.editor.handlers,
-                    &event.editor.workspace_trust,
-                    doc,
-                    None,
-                    false,
-                );
+                let trust_full = git_trust_full(&event.editor.workspace_trust, doc);
+                let _ = request_blame(&event.editor.handlers, doc, trust_full, None, false);
             }
         }
         Ok(())
@@ -206,13 +238,8 @@ pub(super) fn register_hooks(_handlers: &Handlers) {
             // Fetch for every open document; those whose blame is already
             // current are skipped by `request_blame`.
             for doc in event.editor.documents() {
-                let _ = request_blame(
-                    &event.editor.handlers,
-                    &event.editor.workspace_trust,
-                    doc,
-                    None,
-                    false,
-                );
+                let trust_full = git_trust_full(&event.editor.workspace_trust, doc);
+                let _ = request_blame(&event.editor.handlers, doc, trust_full, None, false);
             }
         }
         Ok(())
@@ -244,6 +271,12 @@ mod tests {
             Some(9),
             "the newest request wins"
         );
+        handler.handle_event(request(None), first);
+        assert_eq!(
+            handler.pending[&DocumentId::default()].line,
+            Some(9),
+            "a later request without a line keeps the line the user asked for"
+        );
     }
 
     #[test]
@@ -253,13 +286,14 @@ mod tests {
         assert!(queue.submit(request(Some(1))).is_some(), "idle: starts now");
         assert!(queue.submit(request(Some(2))).is_none(), "busy: waits");
         assert!(queue.submit(request(Some(3))).is_none(), "busy: replaces 2");
+        assert!(queue.submit(request(None)).is_none(), "busy: replaces 3");
         let next = queue
             .finished(doc)
             .expect("the waiting request starts next");
         assert_eq!(
             next.line,
             Some(3),
-            "only the newest waiting request survives"
+            "only the newest waiting request survives, keeping the requested line"
         );
         assert!(
             queue.finished(doc).is_none(),

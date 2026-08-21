@@ -99,6 +99,9 @@ impl FileBlame {
     /// reset, checkout) the mapping is stale even though the file on disk is unchanged.
     /// Conversely, ref traffic that leaves `HEAD` alone (a fetch, tag or stash) does not
     /// invalidate it, and callers use this to skip the expensive recomputation.
+    ///
+    /// Object replacements (`git replace`) are not part of this: gix does not apply
+    /// them when reading objects, so neither the blame nor the diff base ever see them.
     pub fn is_current(&self) -> bool {
         let repo = self.repo.to_thread_local();
         repo.head_id().is_ok_and(|id| id.detach() == self.head)

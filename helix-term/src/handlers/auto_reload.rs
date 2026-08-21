@@ -39,23 +39,27 @@ impl ReloadHandler {
             return;
         }
         let fs_events = event.fs_events.clone();
-        if !fs_events
-            .iter()
-            .any(|event| matches!(event.ty, EventType::Modified | EventType::Create))
-        {
+        if !fs_events.iter().any(|event| {
+            matches!(
+                event.ty,
+                EventType::Modified | EventType::Create | EventType::Delete
+            )
+        }) {
             return;
         }
         let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
         job::dispatch_blocking(move |editor, compositor| {
             let mut vcs_reload = false;
-            let mut history_rewritten = false;
 
             for fs_event in &*fs_events {
                 // Renames (e.g. git committing a ref via <ref>.lock) surface as
-                // Create; those matter for the VCS state but not for buffers.
-                if matches!(fs_event.ty, EventType::Modified | EventType::Create) {
+                // Create, and deleting a branch, tag or replacement is a Delete;
+                // those matter for the VCS state but not for buffers.
+                if matches!(
+                    fs_event.ty,
+                    EventType::Modified | EventType::Create | EventType::Delete
+                ) {
                     vcs_reload |= editor.diff_providers.needs_reload(fs_event);
-                    history_rewritten |= editor.diff_providers.rewrites_history(fs_event);
                 }
                 if fs_event.ty != EventType::Modified {
                     continue;
@@ -69,7 +73,7 @@ impl ReloadHandler {
             }
 
             if vcs_reload {
-                reload_vcs_diffs(editor, history_rewritten);
+                reload_vcs_diffs(editor);
             }
         });
     }
@@ -249,8 +253,7 @@ fn handle_document_change(
 
 /// Reload VCS diffs for all documents
 /// Refresh every document's diff base and blame after the repository's refs moved.
-/// `history_rewritten` forces a new blame even where `HEAD` did not move (`git replace`).
-fn reload_vcs_diffs(editor: &mut Editor, history_rewritten: bool) {
+fn reload_vcs_diffs(editor: &mut Editor) {
     let auto_fetch = editor.config().inline_blame.auto_fetch;
     for doc in editor.documents.values_mut() {
         let Some(path) = doc.path().map(ToOwned::to_owned) else {
@@ -268,21 +271,14 @@ fn reload_vcs_diffs(editor: &mut Editor, history_rewritten: bool) {
             Some(diff_base) => doc.set_diff_base(diff_base),
             None => doc.diff_handle = None,
         }
-        // Blame maps lines to commits as of the HEAD it was computed against.
-        // This watcher also fires for ref traffic that leaves HEAD alone (a
+        // Blame maps lines to commits as of the history it was computed from.
+        // This watcher also fires for ref traffic that leaves history alone (a
         // fetch, tag or stash); `request_blame` keeps a blame that is still
-        // current unless history was rewritten in place. Without auto-fetch,
-        // flag the document so the next `blame_line` re-fetches instead of
-        // reporting the old mapping.
+        // current. Without auto-fetch, flag the document so the next
+        // `blame_line` re-fetches instead of reporting the old mapping.
         if auto_fetch {
-            let _ = request_blame(
-                &editor.handlers,
-                &editor.workspace_trust,
-                doc,
-                None,
-                history_rewritten,
-            );
-        } else if history_rewritten || !doc.blame_is_current() {
+            let _ = request_blame(&editor.handlers, doc, trust_full, None, false);
+        } else if !doc.blame_is_current() {
             doc.is_blame_potentially_out_of_date = true;
         }
     }

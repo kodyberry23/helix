@@ -1712,8 +1712,8 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     if doc.should_request_full_file_blame(auto_fetch) {
         let _ = crate::handlers::blame::request_blame(
             &cx.editor.handlers,
-            &cx.editor.workspace_trust,
             doc,
+            trust_full,
             None,
             false,
         );
@@ -1797,8 +1797,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         if doc.should_request_full_file_blame(blame_compute) {
             let _ = crate::handlers::blame::request_blame(
                 &cx.editor.handlers,
-                &cx.editor.workspace_trust,
                 doc,
+                trust_full,
                 None,
                 false,
             );

@@ -102,16 +102,32 @@ pub fn for_each_changed_file(
 
 /// Get the path to the HEAD file for the git repository containing the given path.
 /// This properly handles both regular repositories and worktrees.
-pub fn get_head_path(path: &Path) -> Option<PathBuf> {
-    // Locating the HEAD file only reads the repository's directory layout, never
+/// Paths whose change means the repository's history may have moved, for polling
+/// when they lie outside the watched workspace. Missing paths are fine: they poll
+/// as absent and fire when they appear.
+pub fn get_watch_paths(path: &Path) -> Vec<PathBuf> {
+    // Locating these files only reads the repository's directory layout, never
     // repository-local config, so Reduced trust is always sufficient here.
-    let repo = open_repo(path, false).ok()?.to_thread_local();
-    // git_dir() returns the path to the actual git directory
-    // For regular repos: /path/to/repo/.git
-    // For worktrees: /path/to/main/.git/worktrees/<name>
+    let Ok(repo) = open_repo(path, false) else {
+        return Vec::new();
+    };
+    let repo = repo.to_thread_local();
+    // For regular repos: /path/to/repo/.git. For linked worktrees:
+    // /path/to/main/.git/worktrees/<name>, whose HEAD is all that is private to
+    // the worktree; its branch and packed refs live in the main repository's
+    // git dir.
     let git_dir = repo.git_dir();
-    let head_path = git_dir.join("HEAD");
-    head_path.exists().then_some(head_path)
+    // gix hands back the `commondir` file verbatim (`<git_dir>/../..`), so
+    // normalize before comparing and joining.
+    let common_dir = helix_stdx::path::normalize(repo.common_dir());
+    let mut paths = vec![git_dir.join("HEAD")];
+    if git_dir != common_dir.as_path() {
+        paths.push(common_dir.join("packed-refs"));
+        if let Ok(Some(branch)) = repo.head_ref() {
+            paths.push(common_dir.join(gix::path::from_bstr(branch.name().as_bstr())));
+        }
+    }
+    paths
 }
 
 fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
