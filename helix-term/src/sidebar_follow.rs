@@ -9,14 +9,16 @@
 //! gently than explicit user reveals (plain `reveal`, sent by A-r/space-f).
 //!
 //! The same socket carries diagnostics: whenever any file's error/warning
-//! counts change, a complete snapshot (`diagnostics-begin <seq>`, one
-//! `diagnostics <errors> <warnings> <abspath>` line per file that has any,
-//! `diagnostics-end <seq>`) covering every file the language servers report
-//! on, open in a buffer or not. Snapshots, not deltas: the sidebar applies
-//! one atomically and ignores any older than the last applied, so nothing
-//! depends on every write arriving, or arriving in order. The latest
-//! snapshot is also sent with every reveal, so a sidebar restarted later
-//! catches up at the next buffer switch.
+//! counts change, a complete snapshot (`diagnostics-begin <sender> <seq>`,
+//! one `diagnostics <errors> <warnings> <abspath>` line per file that has
+//! any, `diagnostics-end <seq>`) covering every file the language servers
+//! report on, open in a buffer or not. Snapshots, not deltas: the sidebar
+//! applies one atomically and, from the same sender, ignores any older than
+//! the last applied, so nothing depends on every write arriving, or arriving
+//! in order; `sender` names this process, so a restarted editor is taken as
+//! is rather than having to outrun the old one's count. The latest snapshot
+//! is also sent with every reveal, so a sidebar restarted later catches up
+//! at the next buffer switch.
 //!
 //! Why a render() poll and not a DocumentFocusLost/DocumentDidOpen hook:
 //! event coverage is incomplete — `Editor::close` and
@@ -28,17 +30,17 @@
 //! corrected at the next frame. The same holds for diagnostics, which arrive
 //! by push (`publishDiagnostics`, for any file) and by pull (open documents):
 //! fingerprinting `editor.diagnostics` per frame (no allocation) covers both.
-//! All socket writes happen on one long-lived sender thread, in order, and
-//! failures are ignored — a missing, stale, or wedged sidebar must never
-//! affect the editor.
+//! All socket writes happen on one long-lived sender thread, in order, fed
+//! through a latest-wins slot (a stalled sidebar cannot make anything queue
+//! up), and failures are ignored — a missing, stale, or wedged sidebar must
+//! never affect the editor.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use helix_core::diagnostic::DiagnosticProvider;
@@ -58,83 +60,105 @@ const RETRY_DEADLINE: Duration = Duration::from_secs(30);
 /// Error and warning counts per file, for the files that have any.
 type DiagnosticSummary = BTreeMap<PathBuf, (u32, u32)>;
 
-/// What the sender thread writes to the sidebar
-enum Outgoing {
-    Reveal(PathBuf),
-    Snapshot {
-        seq: u64,
-        files: Arc<DiagnosticSummary>,
-    },
+/// What is waiting to be written, latest of each kind only: a reveal that has
+/// not gone out yet is superseded by a newer one, and so is a snapshot.
+#[derive(Default)]
+struct Pending {
+    reveal: Option<PathBuf>,
+    snapshot: Option<(u64, Arc<DiagnosticSummary>)>,
+    /// The editor is shutting down: let the sender thread finish.
+    closed: bool,
+}
+
+/// Hand-off between the render loop and the sender thread.
+struct Outbox {
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+
+impl Outbox {
+    fn put(&self, update: impl FnOnce(&mut Pending)) {
+        if let Ok(mut pending) = self.pending.lock() {
+            update(&mut pending);
+            self.wake.notify_one();
+        }
+    }
 }
 
 pub struct SidebarFollow {
-    /// Channel to the sender thread; None disables the feature entirely (no
+    /// Hand-off to the sender thread; None disables the feature entirely (no
     /// TREELIX_SOCKET_PATH, or the thread could not be started).
-    tx: Option<Sender<Outgoing>>,
+    outbox: Option<Arc<Outbox>>,
     /// Last pushed path — send only on change. Updated even when a send
     /// fails or is skipped: once the sidebar has been reachable, a dead
     /// sidebar must not turn every redraw into a reconnect attempt.
     revealed: Option<PathBuf>,
-    /// Latches true after the first successful write (by the sender
-    /// thread). Until then, `first/last_attempt` drive the startup retry.
+    /// Latches true after the first reveal that went through (set by the
+    /// sender thread). Until then, `first/last_attempt` drive the startup
+    /// retry.
     ready: Arc<AtomicBool>,
     first_attempt: Option<Instant>,
     last_attempt: Option<Instant>,
     /// Fingerprint of `editor.diagnostics` as last summarized; the summary is
     /// only rebuilt when it changes.
     fingerprint: u64,
-    /// The latest snapshot and its sequence number. Sequences are seeded from
-    /// the process start time so an editor started later always outranks an
-    /// earlier one in the sidebar's ordering: a restarted helix must not have
-    /// its snapshots ignored until it catches up with the old one's count.
+    /// The latest snapshot and its sequence number, counted from 1 in this
+    /// process (0: none yet); the sender id tells the sidebar whose count
+    /// it is.
     snapshot: Arc<DiagnosticSummary>,
     seq: u64,
-    /// Whether a snapshot has been produced yet.
-    has_snapshot: bool,
+    /// Whether a snapshot was already queued in the current frame (then the
+    /// reveal path need not queue the same one again).
+    queued_this_frame: bool,
 }
 
 impl SidebarFollow {
     pub fn from_env() -> Self {
         let ready = Arc::new(AtomicBool::new(false));
-        let tx = std::env::var_os("TREELIX_SOCKET_PATH")
+        let outbox = std::env::var_os("TREELIX_SOCKET_PATH")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .and_then(|socket| {
-                let (tx, rx) = mpsc::channel();
+                let outbox = Arc::new(Outbox {
+                    pending: Mutex::new(Pending::default()),
+                    wake: Condvar::new(),
+                });
                 let ready = Arc::clone(&ready);
+                let inbox = Arc::clone(&outbox);
                 // `Builder::spawn` reports failure instead of panicking, so a
                 // system that cannot give us a thread just loses the feature.
                 std::thread::Builder::new()
                     .name("sidebar-follow".into())
-                    .spawn(move || sender_loop(socket, rx, ready))
+                    .spawn(move || sender_loop(socket, inbox, ready))
                     .ok()
-                    .map(|_| tx)
+                    .map(|_| outbox)
             });
         SidebarFollow {
-            tx,
+            outbox,
             revealed: None,
             ready,
             first_attempt: None,
             last_attempt: None,
             fingerprint: 0,
             snapshot: Arc::new(DiagnosticSummary::new()),
-            seq: initial_sequence(),
-            has_snapshot: false,
+            seq: 0,
+            queued_this_frame: false,
         }
     }
 
     /// Called once per render.
     pub fn sync(&mut self, editor: &Editor) {
-        if self.tx.is_none() {
+        if self.outbox.is_none() {
             return;
         }
+        self.queued_this_frame = false;
         self.sync_diagnostics(editor);
         self.sync_reveal(editor);
     }
 
     /// Push a reveal if the focused document's path changed (or re-send the
-    /// last one while the startup retry is live), followed by the latest
-    /// diagnostics snapshot. Cheap when nothing changed: one borrowed path
+    /// last one while the startup retry is live), with the latest diagnostics
+    /// snapshot alongside. Cheap when nothing changed: one borrowed path
     /// compare, no allocation.
     fn sync_reveal(&mut self, editor: &Editor) {
         let path = doc!(editor).path();
@@ -153,37 +177,40 @@ impl SidebarFollow {
         let now = Instant::now();
         self.first_attempt.get_or_insert(now);
         self.last_attempt = Some(now);
-        let Some(tx) = &self.tx else {
+        let Some(outbox) = &self.outbox else {
             return;
         };
-        let _ = tx.send(Outgoing::Reveal(path));
-        if self.has_snapshot {
-            let _ = tx.send(Outgoing::Snapshot {
-                seq: self.seq,
-                files: Arc::clone(&self.snapshot),
-            });
-        }
+        // Resend the latest snapshot alongside, unless this frame already
+        // queued it: a sidebar restarted since then catches up here.
+        let snapshot = (self.seq > 0 && !self.queued_this_frame)
+            .then(|| (self.seq, Arc::clone(&self.snapshot)));
+        outbox.put(|pending| {
+            pending.reveal = Some(path);
+            if let Some(snapshot) = snapshot {
+                pending.snapshot = Some(snapshot);
+            }
+        });
     }
 
     /// Push a new snapshot when the per-file error/warning counts changed.
+    /// The first one is sent even when empty: it replaces whatever a previous
+    /// editor left in the sidebar.
     fn sync_diagnostics(&mut self, editor: &Editor) {
         let fingerprint = fingerprint(&editor.diagnostics);
-        if fingerprint == self.fingerprint {
+        if self.seq > 0 && fingerprint == self.fingerprint {
             return;
         }
         self.fingerprint = fingerprint;
         let summary = summarize(&editor.diagnostics);
-        if summary == *self.snapshot {
+        if self.seq > 0 && summary == *self.snapshot {
             return;
         }
         self.seq += 1;
-        self.has_snapshot = true;
         self.snapshot = Arc::new(summary);
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Outgoing::Snapshot {
-                seq: self.seq,
-                files: Arc::clone(&self.snapshot),
-            });
+        self.queued_this_frame = true;
+        if let Some(outbox) = &self.outbox {
+            let snapshot = (self.seq, Arc::clone(&self.snapshot));
+            outbox.put(|pending| pending.snapshot = Some(snapshot));
         }
     }
 
@@ -200,54 +227,68 @@ impl SidebarFollow {
     }
 }
 
-/// The sender thread: writes go out one at a time, in order. Whatever queued
-/// up while a write was in progress is coalesced first, since only the latest
-/// reveal and the latest snapshot matter.
-fn sender_loop(socket: PathBuf, rx: Receiver<Outgoing>, ready: Arc<AtomicBool>) {
-    while let Ok(first) = rx.recv() {
-        let mut reveal = None;
-        let mut snapshot = None;
-        let mut take = |msg| match msg {
-            Outgoing::Reveal(path) => reveal = Some(path),
-            Outgoing::Snapshot { seq, files } => snapshot = Some((seq, files)),
-        };
-        take(first);
-        while let Ok(msg) = rx.try_recv() {
-            take(msg);
+impl Drop for SidebarFollow {
+    fn drop(&mut self) {
+        if let Some(outbox) = &self.outbox {
+            outbox.put(|pending| pending.closed = true);
         }
+    }
+}
+
+/// The sender thread: takes whatever is pending (latest reveal, latest
+/// snapshot), writes them one at a time, reveal first, and waits for more.
+fn sender_loop(socket: PathBuf, outbox: Arc<Outbox>, ready: Arc<AtomicBool>) {
+    let sender = sender_id();
+    loop {
+        let (reveal, snapshot) = {
+            let Ok(mut pending) = outbox.pending.lock() else {
+                return;
+            };
+            while pending.reveal.is_none() && pending.snapshot.is_none() && !pending.closed {
+                pending = match outbox.wake.wait(pending) {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                };
+            }
+            if pending.closed {
+                return;
+            }
+            (pending.reveal.take(), pending.snapshot.take())
+        };
         if let Some(path) = reveal {
-            write(
-                &socket,
-                &format!("reveal-follow {}\n", path.display()),
-                &ready,
-            );
+            // Only a reveal that went through proves the sidebar is up and
+            // pointed at us; the startup retry keys off this.
+            if write(&socket, &format!("reveal-follow {}\n", path.display())) {
+                ready.store(true, Ordering::Relaxed);
+            }
         }
         if let Some((seq, files)) = snapshot {
-            write(&socket, &snapshot_payload(seq, &files), &ready);
+            write(&socket, &snapshot_payload(&sender, seq, &files));
         }
     }
 }
 
-/// One connection, one payload; `ready` latches when it went through.
-fn write(socket: &Path, payload: &str, ready: &AtomicBool) {
+/// One connection, one payload; true when it went through.
+fn write(socket: &Path, payload: &str) -> bool {
     use std::io::Write as _;
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
-        return;
+        return false;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-    if stream.write_all(payload.as_bytes()).is_ok() {
-        ready.store(true, Ordering::Relaxed);
-    }
+    stream.write_all(payload.as_bytes()).is_ok()
 }
 
-/// Where this process's snapshot sequence starts: microseconds since the
-/// epoch, so it exceeds anything an editor started earlier could have sent
-/// (one per render at most, far fewer than one per microsecond).
-fn initial_sequence() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_micros() as u64)
-        .unwrap_or(0)
+/// Names this editor process to the sidebar: pid plus start time, so a new
+/// process never shares an id with one whose pid it inherited.
+fn sender_id() -> String {
+    static START: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let start = START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_micros())
+            .unwrap_or(0)
+    });
+    format!("hx-{}-{start}", std::process::id())
 }
 
 /// A newline in a file name would smuggle a second line into the
@@ -305,8 +346,8 @@ fn summarize(
 }
 
 /// The wire form of one snapshot.
-fn snapshot_payload(seq: u64, files: &DiagnosticSummary) -> String {
-    let mut payload = format!("diagnostics-begin {seq}\n");
+fn snapshot_payload(sender: &str, seq: u64, files: &DiagnosticSummary) -> String {
+    let mut payload = format!("diagnostics-begin {sender} {seq}\n");
     for (path, (errors, warnings)) in files {
         payload.push_str(&format!(
             "diagnostics {errors} {warnings} {}\n",
@@ -382,10 +423,14 @@ mod tests {
     }
 
     #[test]
-    fn a_later_process_outranks_an_earlier_one() {
-        let earlier = initial_sequence();
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(initial_sequence() > earlier + 1000);
+    fn the_sender_id_is_stable_within_the_process_and_names_it() {
+        let id = sender_id();
+        assert_eq!(id, sender_id());
+        assert!(
+            id.starts_with(&format!("hx-{}-", std::process::id())),
+            "{id}"
+        );
+        assert!(!id.contains(' '), "the wire form is space separated");
     }
 
     #[test]
@@ -394,16 +439,36 @@ mod tests {
         files.insert(PathBuf::from("/r/new dir/new.rs"), (0, 1));
         files.insert(PathBuf::from("/r/a.rs"), (3, 1));
         assert_eq!(
-            snapshot_payload(7, &files),
-            "diagnostics-begin 7\n\
+            snapshot_payload("hx-1-2", 7, &files),
+            "diagnostics-begin hx-1-2 7\n\
              diagnostics 3 1 /r/a.rs\n\
              diagnostics 0 1 /r/new dir/new.rs\n\
              diagnostics-end 7\n"
         );
         assert_eq!(
-            snapshot_payload(8, &DiagnosticSummary::new()),
-            "diagnostics-begin 8\ndiagnostics-end 8\n",
+            snapshot_payload("hx-1-2", 8, &DiagnosticSummary::new()),
+            "diagnostics-begin hx-1-2 8\ndiagnostics-end 8\n",
             "an empty snapshot clears everything"
         );
+    }
+
+    /// The outbox keeps only the latest of each kind, so a stalled sidebar
+    /// can never make writes pile up.
+    #[test]
+    fn the_outbox_is_latest_wins() {
+        let outbox = Outbox {
+            pending: Mutex::new(Pending::default()),
+            wake: Condvar::new(),
+        };
+        let files = Arc::new(DiagnosticSummary::new());
+        for seq in 1..=3 {
+            let files = Arc::clone(&files);
+            outbox.put(|pending| pending.snapshot = Some((seq, files)));
+        }
+        outbox.put(|pending| pending.reveal = Some(PathBuf::from("/r/a.rs")));
+        outbox.put(|pending| pending.reveal = Some(PathBuf::from("/r/b.rs")));
+        let pending = outbox.pending.lock().unwrap();
+        assert_eq!(pending.snapshot.as_ref().map(|(seq, _)| *seq), Some(3));
+        assert_eq!(pending.reveal.as_deref(), Some(Path::new("/r/b.rs")));
     }
 }
