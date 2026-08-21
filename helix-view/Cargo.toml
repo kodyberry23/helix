@@ -29,7 +29,8 @@ helix-event = { path = "../helix-event" }
 helix-loader = { path = "../helix-loader" }
 helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
-helix-vcs = { path = "../helix-vcs" }
+# `git` is required: `Document` stores `helix_vcs::FileBlame` (inline git blame).
+helix-vcs = { path = "../helix-vcs", features = ["git"] }
 
 bitflags.workspace = true
 foldhash.workspace = true

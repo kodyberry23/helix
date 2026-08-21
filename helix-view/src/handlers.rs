@@ -24,6 +24,19 @@ pub enum AutoReloadEvent {
     PollAfter { interval: u64 },
 }
 
+#[derive(Debug)]
+pub struct BlameEvent {
+    /// The path for which we request blame
+    pub path: std::path::PathBuf,
+    /// Document for which the blame is requested
+    pub doc_id: DocumentId,
+    /// If this field is set, when we obtain the blame for the file we will
+    /// show blame for this line in the status line
+    pub line: Option<u32>,
+    /// Whether the document's workspace is trusted for git operations (gix `Trust::Full`)
+    pub trust_full: bool,
+}
+
 pub struct Handlers {
     // only public because most of the actual implementation is in helix-term right now :/
     pub completions: CompletionHandler,
@@ -31,6 +44,7 @@ pub struct Handlers {
     pub auto_save: Sender<AutoSaveEvent>,
     pub auto_reload: Sender<AutoReloadEvent>,
     pub document_colors: Sender<lsp::DocumentColorsEvent>,
+    pub blame: Sender<BlameEvent>,
     pub document_links: Sender<lsp::DocumentLinksEvent>,
     pub word_index: word_index::Handler,
     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,

@@ -8,16 +8,23 @@ use helix_lsp::{
 };
 use helix_stdx::path::get_relative_path;
 use helix_view::{
-    align_view, document::{DocumentOpenError, DocumentSavedEventResult}, editor::{ConfigEvent, EditorEvent}, graphics::Rect, theme, tree::Layout, Align, Editor
+    align_view,
+    document::{DocumentOpenError, DocumentSavedEventResult},
+    editor::{ConfigEvent, EditorEvent},
+    events::EditorConfigDidChange,
+    graphics::Rect,
+    theme,
+    tree::Layout,
+    Align, Editor,
 };
 use serde_json::json;
-use tui::backend::Backend;
-#[cfg(unix)]
-use tokio::net::UnixListener;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 #[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(unix)]
 use tokio::sync::mpsc;
+use tui::backend::Backend;
 
 use crate::{
     args::Args,
@@ -107,21 +114,23 @@ async fn start_unix_socket_listener(tx: mpsc::Sender<String>) {
         let path = std::path::PathBuf::from(path);
         // Check if parent folder exists
         if !path.parent().is_some_and(|parent| parent.exists()) {
-            eprintln!("Folder for socket {} does not exists!", path.parent().unwrap().display())
+            eprintln!(
+                "Folder for socket {} does not exists!",
+                path.parent().unwrap().display()
+            )
         }
         path
     } else {
-        let path = std::env::var("XDG_RUNTIME_DIR")
-                .unwrap_or("/tmp".to_string());
+        let path = std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".to_string());
         let path = std::path::PathBuf::from(path)
             .join("helix")
             .join("helix.sock");
         // We unwrap, as any of variants will have parent folder
         let parent_folder = path.parent().unwrap();
         if !parent_folder.exists() {
-            if let Err(e) = create_dir(parent_folder.to_path_buf()) {
+            if let Err(e) = create_dir(parent_folder) {
                 eprintln!("Failed to create socket directory: {}", e);
-                return
+                return;
             }
         }
         path
@@ -131,7 +140,7 @@ async fn start_unix_socket_listener(tx: mpsc::Sender<String>) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("Failed to bind listener to socket: {}", e);
-            return
+            return;
         }
     };
 
@@ -147,11 +156,11 @@ async fn start_unix_socket_listener(tx: mpsc::Sender<String>) {
                     Ok(n) if n > 0 => {
                         let msg = String::from_utf8_lossy(&buf[..n]).to_string();
                         let _ = tx.send(msg).await;
-                    },
-                    Ok(_) => {},
+                    }
+                    Ok(_) => {}
                     Err(e) => eprintln!("Socket read error: {}", e),
                 }
-            },
+            }
             Err(e) => eprintln!("Socket accept error: {}", e),
         }
     }
@@ -466,6 +475,10 @@ impl Application {
             // the Application can apply it.
             ConfigEvent::Update(editor_config) => {
                 let mut app_config = (*self.config.load().clone()).clone();
+                helix_event::dispatch(EditorConfigDidChange {
+                    old_config: &app_config.editor,
+                    editor: &mut self.editor,
+                });
                 app_config.editor = *editor_config;
                 if let Err(err) = self.terminal.reconfigure((&app_config.editor).into()) {
                     self.editor.set_error(err.to_string());
@@ -866,26 +879,29 @@ impl Application {
 
         if let Ok(command) = command {
             // command.execute(&mut cx);
-            if let MappableCommand::Typable {name, ..} = &command {
+            if let MappableCommand::Typable { name, .. } = &command {
                 if [
-                    "run-shell-command", 
-                    "write", 
-                    "write!", 
-                    "write-buffet-close", 
-                    "write-buffer-close!", 
-                    "write-quit", 
-                    "write-quit!", 
-                    "write-all", 
-                    "write-all!", 
-                    "write-quit-all", 
-                    "write-quit-all!"
-                    ].contains(&name.as_str()) {
-                        let severity = Severity::Error;
-                        let err_string = Cow::from(format!("Running command {name} is forbidden from socket"));
-                        self.editor.status_msg = Some((err_string, severity));
-                        helix_event::request_redraw();
-                        return;
-                    }
+                    "run-shell-command",
+                    "write",
+                    "write!",
+                    "write-buffet-close",
+                    "write-buffer-close!",
+                    "write-quit",
+                    "write-quit!",
+                    "write-all",
+                    "write-all!",
+                    "write-quit-all",
+                    "write-quit-all!",
+                ]
+                .contains(&name.as_str())
+                {
+                    let severity = Severity::Error;
+                    let err_string =
+                        Cow::from(format!("Running command {name} is forbidden from socket"));
+                    self.editor.status_msg = Some((err_string, severity));
+                    helix_event::request_redraw();
+                    return;
+                }
             }
             // Any incoming socket command supersedes an armed window picker:
             // the picker-arming commands re-arm during their own execution
@@ -900,7 +916,7 @@ impl Application {
                 register: None,
                 callback: Vec::new(),
                 on_next_key_callback: None,
-                jobs: &mut self.jobs
+                jobs: &mut self.jobs,
             };
             command.execute(&mut cx);
         }
