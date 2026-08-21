@@ -127,9 +127,6 @@ impl Default for DiffProviderRegistry {
     }
 }
 
-/// A union type that includes all types that implement [DiffProvider]. We need this type to allow
-/// cloning [DiffProviderRegistry] as `Clone` cannot be used in trait objects.
-///
 /// Canonical form of `path`, for comparison with the file watcher's events, which
 /// are canonical (`/tmp` is a symlink on macOS, project directories often are).
 /// The path itself may not exist yet (the ref of an unborn branch), so the longest
@@ -154,6 +151,9 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
     }
 }
 
+/// A union type that includes all types that implement [DiffProvider]. We need this type to allow
+/// cloning [DiffProviderRegistry] as `Clone` cannot be used in trait objects.
+///
 /// `Copy` is simply to ensure the `clone()` call is the simplest it can be.
 #[derive(Copy, Clone, Debug)]
 enum DiffProvider {

@@ -265,7 +265,7 @@ fn reload_vcs_diffs(editor: &mut Editor) {
         // current. Without auto-fetch, flag the document so the next
         // `blame_line` re-fetches instead of reporting the old mapping.
         if auto_fetch {
-            let _ = request_blame(&editor.handlers, doc, trust_full, None, false);
+            let _ = request_blame(&editor.handlers, doc, trust_full, None);
         } else if !doc.blame_is_current() {
             doc.is_blame_potentially_out_of_date = true;
         }

@@ -229,12 +229,14 @@ impl Watcher {
             .into_iter()
             .filter(|path| !path.starts_with(&workspace))
             .map(|path| {
-                // Keep the baseline of a path already tracked: re-resolving the set
-                // must not absorb a change that landed since the last poll.
-                let mtime = match previous.iter().find(|(known, _)| *known == path) {
-                    Some((_, mtime)) => *mtime,
-                    None => path.metadata().ok().and_then(|m| m.modified().ok()),
-                };
+                // Keep the baseline of a path already tracked, and give a path new
+                // to the set none at all: its first poll then reports it changed,
+                // one cheap VCS refresh that guarantees nothing which happened while
+                // the set was being re-resolved is absorbed.
+                let mtime = previous
+                    .iter()
+                    .find(|(known, _)| *known == path)
+                    .and_then(|(_, mtime)| *mtime);
                 (path, mtime)
             })
             .collect();

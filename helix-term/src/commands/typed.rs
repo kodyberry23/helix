@@ -1710,13 +1710,7 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     }
 
     if doc.should_request_full_file_blame(auto_fetch) {
-        let _ = crate::handlers::blame::request_blame(
-            &cx.editor.handlers,
-            doc,
-            trust_full,
-            None,
-            false,
-        );
+        let _ = crate::handlers::blame::request_blame(&cx.editor.handlers, doc, trust_full, None);
     }
     doc.is_blame_potentially_out_of_date = true;
 
@@ -1788,13 +1782,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         }
 
         if doc.should_request_full_file_blame(blame_compute) {
-            let _ = crate::handlers::blame::request_blame(
-                &cx.editor.handlers,
-                doc,
-                trust_full,
-                None,
-                false,
-            );
+            let _ =
+                crate::handlers::blame::request_blame(&cx.editor.handlers, doc, trust_full, None);
         }
         doc.is_blame_potentially_out_of_date = true;
     }

@@ -3716,7 +3716,7 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
 
     if needs_fetch {
         let trust_full = git_trust_full(&editor.workspace_trust, doc);
-        match request_blame(&editor.handlers, doc, trust_full, Some(cursor_line), false) {
+        match request_blame(&editor.handlers, doc, trust_full, Some(cursor_line)) {
             Ok(()) => {
                 let path = doc
                     .path()

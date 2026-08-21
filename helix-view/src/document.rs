@@ -336,6 +336,16 @@ pub struct DocumentInlayHintsId {
     pub last_line: usize,
 }
 
+/// What a document holds for blame, relative to the repository's current `HEAD`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldBlame {
+    /// No blame, or a failed one
+    Nothing,
+    /// A blame computed against an earlier `HEAD`
+    Stale,
+    Current,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LineBlameError<'a> {
     #[error("Not committed yet")]
@@ -803,10 +813,19 @@ impl Document {
         }
     }
 
-    /// Whether the blame this document holds was computed against the repository's
-    /// current `HEAD`. See [`helix_vcs::FileBlame::is_current`].
+    /// The blame this document holds, relative to the repository's current `HEAD`.
+    /// See [`helix_vcs::FileBlame::is_current`].
+    pub fn held_blame(&self) -> HeldBlame {
+        match &self.file_blame {
+            Some(Ok(blame)) if blame.is_current() => HeldBlame::Current,
+            Some(Ok(_)) => HeldBlame::Stale,
+            _ => HeldBlame::Nothing,
+        }
+    }
+
+    /// Whether the blame this document holds was computed against the current `HEAD`
     pub fn blame_is_current(&self) -> bool {
-        matches!(&self.file_blame, Some(Ok(blame)) if blame.is_current())
+        self.held_blame() == HeldBlame::Current
     }
 
     pub fn should_request_full_file_blame(&mut self, auto_fetch: bool) -> bool {
