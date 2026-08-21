@@ -27,6 +27,8 @@ pub struct FileBlame {
     blame: Mutex<HashMap<u32, LineBlameUnit>>,
     /// The owning repository for this file's `ObjectId`s
     repo: gix::ThreadSafeRepository,
+    /// The commit this blame was computed against
+    head: gix::ObjectId,
 }
 
 impl FileBlame {
@@ -71,10 +73,13 @@ impl FileBlame {
             author_name: author.map(|a| a.name.to_string()),
             author_email: author.map(|a| a.email.to_string()),
             commit_date: time.and_then(|time| time.format(gix::date::time::format::SHORT).ok()),
-            commit_title: message.as_ref().map(|msg| msg.title.to_string()),
+            // `summary()` is git's `%s`: trimmed, with newlines collapsed. `title`
+            // alone keeps the trailing newline of a message that has no body, and
+            // a newline must never reach the virtual text.
+            commit_title: message.as_ref().map(|msg| msg.summary().to_string()),
             commit_body: message
                 .as_ref()
-                .and_then(|msg| msg.body.map(|body| body.to_string())),
+                .and_then(|msg| msg.body.map(|body| body.to_string().trim_end().to_owned())),
             time_stamp: time.map(|time| (time.seconds, time.offset)),
             time_ago: None,
         };
@@ -88,7 +93,23 @@ impl FileBlame {
     }
 
     /// Compute blame for this file (expensive)
+    /// Whether this blame was computed against the repository's current `HEAD`.
+    ///
+    /// Blame maps lines to commits as of one `HEAD`; once `HEAD` moves (commit, amend,
+    /// reset, checkout) the mapping is stale even though the file on disk is unchanged.
+    /// Conversely, ref traffic that leaves `HEAD` alone (a fetch, tag or stash) does not
+    /// invalidate it, and callers use this to skip the expensive recomputation.
+    pub fn is_current(&self) -> bool {
+        let repo = self.repo.to_thread_local();
+        repo.head_id().is_ok_and(|id| id.detach() == self.head)
+    }
+
     pub fn try_new(file: PathBuf, trust_full: bool) -> Result<Self> {
+        // Resolve symlinks first, as `get_diff_base` does: the workdir gix reports for a
+        // linked worktree comes from `.git/worktrees/<name>/gitdir`, which git writes as a
+        // realpath, so a symlinked component in `file` (macOS `/tmp`, a linked project
+        // directory) would otherwise never match it below.
+        let file = gix::path::realpath(&file).context("resolve symlinks")?;
         let thread_safe_repo =
             open_repo(get_repo_dir(&file)?, trust_full).context("Failed to open git repo")?;
         let repo = thread_safe_repo.to_thread_local();
@@ -123,6 +144,7 @@ impl FileBlame {
                     .collect(),
             ),
             repo: thread_safe_repo,
+            head,
         })
     }
 }
@@ -412,9 +434,10 @@ mod test {
                                     .blame_for_line(line_number, added_lines, removed_lines)
                                     .commit_title;
 
+                            // `{title}` is git's `%s`: no trailing newline.
                             assert_eq!(
                                 blame_result,
-                                Some(concat!(stringify!($expected), newline_literal!()).to_owned()),
+                                Some(stringify!($expected).to_owned()),
                                 "Blame mismatch\nat commit: {}\nat line: {}\nline contents: {}\nexpected commit: {}\nbut got commit: {}",
                                 $commit_msg,
                                 line_number,
@@ -620,5 +643,66 @@ mod test {
             .parse_format(format),
             "2028-01-10 • f14ab1cf".to_owned()
         );
+    }
+
+    fn write_and_commit(repo: &std::path::Path, name: &str, content: &str, message: &str) {
+        std::fs::write(repo.join(name), content).unwrap();
+        create_commit_with_message(repo, true, message);
+    }
+
+    #[test]
+    fn is_current_tracks_head() {
+        let repo = empty_git_repo();
+        write_and_commit(repo.path(), "file.txt", "one\n", "first");
+        let blame = FileBlame::try_new(repo.path().join("file.txt"), true).unwrap();
+        assert!(blame.is_current(), "fresh blame must be current");
+        assert_eq!(
+            blame.blame_for_line(0, 0, 0).parse_format("{title}"),
+            "first"
+        );
+
+        write_and_commit(repo.path(), "file.txt", "two\n", "second");
+        assert!(
+            !blame.is_current(),
+            "a new commit moves HEAD and must make the old blame stale"
+        );
+        let blame = FileBlame::try_new(repo.path().join("file.txt"), true).unwrap();
+        assert!(blame.is_current());
+        assert_eq!(
+            blame.blame_for_line(0, 0, 0).parse_format("{title}"),
+            "second"
+        );
+    }
+
+    /// A linked worktree keeps its git dir under the main repository, and git records
+    /// the worktree's location as a realpath. Opening a file through a symlinked path
+    /// (macOS `/tmp`, `/var`, a linked project directory) must still blame.
+    #[cfg(unix)]
+    #[test]
+    fn blame_in_linked_worktree_through_symlinked_path() {
+        let repo = empty_git_repo();
+        write_and_commit(repo.path(), "file.txt", "worktree line\n", "in main");
+
+        let worktrees = tempfile::tempdir().unwrap();
+        let worktree = worktrees.path().join("wt");
+        crate::git::test::exec_git_cmd(
+            &["worktree", "add", "-b", "wt", worktree.to_str().unwrap()],
+            repo.path(),
+        );
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("link");
+        std::os::unix::fs::symlink(&worktree, &link).unwrap();
+
+        for path in [worktree.join("file.txt"), link.join("file.txt")] {
+            let blame = FileBlame::try_new(path.clone(), true)
+                .unwrap_or_else(|err| panic!("blame failed for {}: {err:#}", path.display()));
+            assert_eq!(
+                blame.blame_for_line(0, 0, 0).parse_format("{title}"),
+                "in main",
+                "wrong blame for {}",
+                path.display()
+            );
+            assert!(blame.is_current());
+        }
     }
 }

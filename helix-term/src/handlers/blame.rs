@@ -1,6 +1,6 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
-use helix_event::register_hook;
+use helix_event::{register_hook, AsyncHook, TaskController};
 use helix_loader::workspace_trust::TrustQuery;
 use helix_vcs::FileBlame;
 use helix_view::{
@@ -8,29 +8,34 @@ use helix_view::{
     handlers::{BlameEvent, Handlers},
     DocumentId,
 };
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
 
 use crate::job;
 
-/// A blame request waiting for the debounce window to close
-struct PendingBlame {
-    path: PathBuf,
-    trust_full: bool,
-    /// If `Some`, show the blame for this line in the statusline once it is available
-    line: Option<u32>,
-}
+/// Concurrent full-file blames allowed at once. gix blame is CPU-bound, so a burst
+/// (every open document after enabling `auto-fetch`, or a refs update with many
+/// buffers open) must not take over every core the editor shares with the user.
+static BLAME_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    Semaphore::new((cores / 2).max(1))
+});
 
 /// Computes Git Blame for documents
 #[derive(Default)]
 pub struct BlameHandler {
     /// Requests received during the current debounce window, one per document.
     /// A newer request for a document replaces the older one, so a burst of
-    /// events (e.g. every open document after enabling `auto-fetch`) costs one
-    /// blame per document rather than one per event, and no document is lost.
-    pending: HashMap<DocumentId, PendingBlame>,
+    /// events costs one blame per document rather than one per event, and no
+    /// document is lost.
+    pending: HashMap<DocumentId, BlameEvent>,
+    /// One controller per document. Starting a new blame cancels the one still
+    /// in flight for that document, so a result computed against an older
+    /// `HEAD` can never land after (and overwrite) a newer one. Entries are a
+    /// few words each and live for the session.
+    in_flight: HashMap<DocumentId, TaskController>,
 }
 
-impl helix_event::AsyncHook for BlameHandler {
+impl AsyncHook for BlameHandler {
     type Event = BlameEvent;
 
     fn handle_event(
@@ -38,33 +43,44 @@ impl helix_event::AsyncHook for BlameHandler {
         event: Self::Event,
         _timeout: Option<tokio::time::Instant>,
     ) -> Option<tokio::time::Instant> {
-        self.pending.insert(
-            event.doc_id,
-            PendingBlame {
-                path: event.path,
-                trust_full: event.trust_full,
-                line: event.line,
-            },
-        );
+        self.pending.insert(event.doc_id, event);
         Some(Instant::now() + Duration::from_millis(50))
     }
 
     fn finish_debounce(&mut self) {
         for (doc_id, request) in self.pending.drain() {
-            let PendingBlame {
-                path,
-                trust_full,
-                line,
-            } = request;
+            let cancel = self.in_flight.entry(doc_id).or_default().restart();
             tokio::spawn(async move {
-                // gix blame walks the history of the whole file and can take
-                // seconds on large or old files. Run it on the blocking pool so
-                // it never stalls the async runtime or this hook's event loop.
-                let result =
+                let BlameEvent {
+                    path,
+                    trust_full,
+                    line,
+                    ..
+                } = request;
+                let result = {
+                    let Ok(_permit) = BLAME_PERMITS.acquire().await else {
+                        return;
+                    };
+                    // Superseded while waiting for a permit: skip the work entirely.
+                    if cancel.is_canceled() {
+                        return;
+                    }
+                    // gix blame walks the history of the whole file and can take
+                    // seconds on large or old files. Run it on the blocking pool so
+                    // it never stalls the async runtime or this hook's event loop.
                     tokio::task::spawn_blocking(move || FileBlame::try_new(path, trust_full))
                         .await
-                        .unwrap_or_else(|err| Err(anyhow::anyhow!("blame task failed: {err}")));
+                        .unwrap_or_else(|err| Err(anyhow::anyhow!("blame task failed: {err}")))
+                };
+                if cancel.is_canceled() {
+                    return;
+                }
                 job::dispatch(move |editor, _| {
+                    // Re-checked on the main thread: a newer request may have been
+                    // started while this result was queued for dispatch.
+                    if cancel.is_canceled() {
+                        return;
+                    }
                     let Some(doc) = editor.document_mut(doc_id) else {
                         return;
                     };
@@ -145,4 +161,32 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         }
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(line: Option<u32>) -> BlameEvent {
+        BlameEvent {
+            path: "/repo/file.rs".into(),
+            doc_id: DocumentId::default(),
+            line,
+            trust_full: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn later_request_for_a_document_replaces_the_earlier_one() {
+        let mut handler = BlameHandler::default();
+        let first = handler.handle_event(request(Some(5)), None);
+        assert!(first.is_some(), "a request must open a debounce window");
+        handler.handle_event(request(Some(9)), first);
+        assert_eq!(handler.pending.len(), 1, "one pending blame per document");
+        assert_eq!(
+            handler.pending[&DocumentId::default()].line,
+            Some(9),
+            "the newest request wins"
+        );
+    }
 }

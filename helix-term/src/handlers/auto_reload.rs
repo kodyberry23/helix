@@ -263,10 +263,15 @@ fn reload_vcs_diffs(editor: &mut Editor) {
             Some(diff_base) => doc.set_diff_base(diff_base),
             None => doc.diff_handle = None,
         }
-        // The blame we hold maps lines to commits as of the HEAD it was computed
-        // against, and that HEAD just moved (commit, amend, reset, checkout).
-        // Re-fetch now under auto-fetch; otherwise flag it so the next
-        // `blame_line` re-fetches instead of reporting the old mapping.
+        // Blame maps lines to commits as of the HEAD it was computed against.
+        // This watcher also fires for ref traffic that leaves HEAD alone (a
+        // fetch, tag or stash), so skip the expensive re-request unless HEAD
+        // really moved (commit, amend, reset, checkout). Then re-fetch under
+        // auto-fetch, or flag it so the next `blame_line` re-fetches instead
+        // of reporting the old mapping.
+        if matches!(&doc.file_blame, Some(Ok(blame)) if blame.is_current()) {
+            continue;
+        }
         if auto_fetch {
             send_blocking(
                 &editor.handlers.blame,
