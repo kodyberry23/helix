@@ -103,11 +103,10 @@ impl FileBlame {
             // NOTE: bstr always uses unix separators `/`, even on
             // Windows which uses the `\` separator
             &gix::path::to_unix_separators_on_windows(gix::path::try_into_bstr(
-                file.strip_prefix(
-                    repo.path()
-                        .parent()
-                        .context("Could not get the parent path of the repo")?,
-                )?,
+                // `workdir()` (not `path().parent()`): for linked worktrees and
+                // submodules the git dir lives elsewhere, so the parent of the
+                // git dir is not the checkout this file belongs to.
+                file.strip_prefix(repo.workdir().context("repo has no worktree")?)?,
             )?),
             gix::blame::Options::default(),
         )?

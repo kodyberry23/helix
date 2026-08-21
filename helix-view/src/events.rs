@@ -17,10 +17,6 @@ events! {
         changes: &'a ChangeSet,
         ghost_transaction: bool
     }
-    EditorConfigDidChange<'a> {
-        old_config: &'a Config,
-        editor: &'a mut Editor
-    }
     DocumentDidClose<'a> {
         editor: &'a mut Editor,
         doc: Document

@@ -9,7 +9,7 @@ use helix_core::file_watcher::{events_from_paths, EventType, FileSystemDidChange
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_view::editor::Config;
 use helix_view::events::ConfigDidChange;
-use helix_view::handlers::{AutoReloadEvent, Handlers};
+use helix_view::handlers::{AutoReloadEvent, BlameEvent, Handlers};
 use helix_view::{DocumentId, Editor};
 use tokio::time::Instant;
 
@@ -246,8 +246,9 @@ fn handle_document_change(
 
 /// Reload VCS diffs for all documents
 fn reload_vcs_diffs(editor: &mut Editor) {
+    let auto_fetch = editor.config().inline_blame.auto_fetch;
     for doc in editor.documents.values_mut() {
-        let Some(path) = doc.path() else {
+        let Some(path) = doc.path().map(ToOwned::to_owned) else {
             continue;
         };
         // Per-document trust: each doc's workspace may differ.
@@ -258,9 +259,26 @@ fn reload_vcs_diffs(editor: &mut Editor) {
                 helix_loader::workspace_trust::TrustQuery::Git,
             )
             .is_trusted();
-        match editor.diff_providers.get_diff_base(path, trust_full) {
+        match editor.diff_providers.get_diff_base(&path, trust_full) {
             Some(diff_base) => doc.set_diff_base(diff_base),
             None => doc.diff_handle = None,
+        }
+        // The blame we hold maps lines to commits as of the HEAD it was computed
+        // against, and that HEAD just moved (commit, amend, reset, checkout).
+        // Re-fetch now under auto-fetch; otherwise flag it so the next
+        // `blame_line` re-fetches instead of reporting the old mapping.
+        if auto_fetch {
+            send_blocking(
+                &editor.handlers.blame,
+                BlameEvent {
+                    path,
+                    doc_id: doc.id(),
+                    line: None,
+                    trust_full,
+                },
+            );
+        } else {
+            doc.is_blame_potentially_out_of_date = true;
         }
     }
 }
