@@ -69,6 +69,14 @@ impl DiffProviderRegistry {
             .any(|provider| provider.needs_reload(fs_event))
     }
 
+    /// Whether this event rewrites history in place, changing blame output while
+    /// `HEAD` stays where it is.
+    pub fn rewrites_history(&self, fs_event: &helix_core::file_watcher::Event) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.rewrites_history(fs_event))
+    }
+
     /// Get paths that need to be watched for VCS state changes.
     /// These are paths like HEAD files that indicate branch/commit changes.
     /// The workspace path is used to determine if the VCS metadata is external.
@@ -125,6 +133,29 @@ enum DiffProvider {
 }
 
 impl DiffProvider {
+    /// `git replace` swaps objects as every reader sees them, so blame computed at
+    /// the same `HEAD` changes when `refs/replace/*` moves.
+    pub fn rewrites_history(&self, fs_event: &helix_core::file_watcher::Event) -> bool {
+        match self {
+            #[cfg(feature = "git")]
+            DiffProvider::Git => {
+                let path = fs_event.path.as_std_path();
+                if path.extension().is_some_and(|ext| ext == "lock") {
+                    return false;
+                }
+                let mut comps = path.components().map(|c| c.as_os_str());
+                while let Some(comp) = comps.next() {
+                    if comp == ".git" {
+                        return comps.next() == Some("refs".as_ref())
+                            && comps.next() == Some("replace".as_ref());
+                    }
+                }
+                false
+            }
+            DiffProvider::None => false,
+        }
+    }
+
     pub fn needs_reload(&self, fs_event: &helix_core::file_watcher::Event) -> bool {
         match self {
             #[cfg(feature = "git")]
@@ -235,6 +266,29 @@ mod tests {
             ty: EventType::Modified,
         };
         assert!(!provider.needs_reload(&event));
+    }
+
+    #[cfg(feature = "git")]
+    #[test]
+    fn test_rewrites_history_only_for_replace_refs() {
+        use helix_core::file_watcher::{CanonicalPathBuf, Event, EventType};
+        use std::path::Path;
+
+        let provider = DiffProvider::Git;
+        let event = |path: &str| Event {
+            path: CanonicalPathBuf::assert_canonicalized(Path::new(path)),
+            ty: EventType::Modified,
+        };
+
+        let replace = event("/home/user/repo/.git/refs/replace/0123abcd");
+        assert!(provider.rewrites_history(&replace));
+        // A replace ref also moves the diff base watch, like any ref.
+        assert!(provider.needs_reload(&replace));
+
+        assert!(!provider.rewrites_history(&event("/home/user/repo/.git/refs/heads/main")));
+        assert!(!provider.rewrites_history(&event("/home/user/repo/.git/refs/replace/x.lock")));
+        assert!(!provider.rewrites_history(&event("/home/user/repo/.git/HEAD")));
+        assert!(!provider.rewrites_history(&event("/home/user/repo/refs/replace/not-a-git-dir")));
     }
 
     #[cfg(feature = "git")]

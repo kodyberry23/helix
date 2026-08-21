@@ -29,17 +29,26 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
     file.parent().context("file has no parent directory")
 }
 
+/// Resolve `file` to its realpath and open the repository that contains it.
+///
+/// Every entry point that maps a document onto git objects starts here. git records
+/// linked worktrees as realpaths, so a symlinked component in `file` (macOS `/tmp`, a
+/// linked project directory) only matches the repository's workdir once resolved.
+pub(crate) fn open_repo_for_file(
+    file: &Path,
+    trust_full: bool,
+) -> Result<(PathBuf, ThreadSafeRepository)> {
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full).context("failed to open git repo")?;
+    Ok((file, repo))
+}
+
 pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
-
     // TODO cache repository lookup
-
-    let repo_dir = get_repo_dir(&file)?;
-    let repo = open_repo(repo_dir, trust_full)
-        .context("failed to open git repo")?
-        .to_thread_local();
+    let (file, repo) = open_repo_for_file(file, trust_full)?;
+    let repo = repo.to_thread_local();
     let head = repo.head_commit()?;
     let file_oid = find_file_in_commit(&repo, &head, &file)?;
 
@@ -70,12 +79,8 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
 pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
-    let file = gix::path::realpath(file).context("resolve symlinks")?;
-
-    let repo_dir = get_repo_dir(&file)?;
-    let repo = open_repo(repo_dir, trust_full)
-        .context("failed to open git repo")?
-        .to_thread_local();
+    let (_, repo) = open_repo_for_file(file, trust_full)?;
+    let repo = repo.to_thread_local();
     let head_ref = repo.head_ref()?;
     let head_commit = repo.head_commit()?;
 

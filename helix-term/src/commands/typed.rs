@@ -14,7 +14,6 @@ use helix_stdx::path::home_dir;
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ConfigEvent};
 use helix_view::expansion;
-use helix_view::handlers::BlameEvent;
 use serde_json::Value;
 use ui::completers::{self, Completer};
 
@@ -1701,7 +1700,6 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         .map(|_| {
             view.ensure_cursor_in_view(doc, scrolloff);
         })?;
-    let doc_id = doc.id();
     if let Some(path) = doc.path().map(ToOwned::to_owned) {
         if !cx.editor.file_watcher.is_watching(&path) {
             cx.editor
@@ -1712,17 +1710,13 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     }
 
     if doc.should_request_full_file_blame(auto_fetch) {
-        if let Some(path) = doc.path() {
-            helix_event::send_blocking(
-                &cx.editor.handlers.blame,
-                BlameEvent {
-                    path: path.to_path_buf(),
-                    doc_id,
-                    line: None,
-                    trust_full,
-                },
-            );
-        }
+        let _ = crate::handlers::blame::request_blame(
+            &cx.editor.handlers,
+            &cx.editor.workspace_trust,
+            doc,
+            None,
+            false,
+        );
     }
     doc.is_blame_potentially_out_of_date = true;
 
@@ -1801,17 +1795,13 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         }
 
         if doc.should_request_full_file_blame(blame_compute) {
-            if let Some(path) = doc.path() {
-                helix_event::send_blocking(
-                    &cx.editor.handlers.blame,
-                    BlameEvent {
-                        path: path.to_path_buf(),
-                        doc_id,
-                        line: None,
-                        trust_full,
-                    },
-                );
-            }
+            let _ = crate::handlers::blame::request_blame(
+                &cx.editor.handlers,
+                &cx.editor.workspace_trust,
+                doc,
+                None,
+                false,
+            );
         }
         doc.is_blame_potentially_out_of_date = true;
     }

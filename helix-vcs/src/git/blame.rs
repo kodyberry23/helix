@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{get_repo_dir, open_repo};
+use super::open_repo_for_file;
 
 /// Allows us to save compute resources when requesting blame for the same line
 /// To go from an `ObjectId` (which represents a commit) to `LineBLame`, we have to perform some work.
@@ -105,13 +105,7 @@ impl FileBlame {
     }
 
     pub fn try_new(file: PathBuf, trust_full: bool) -> Result<Self> {
-        // Resolve symlinks first, as `get_diff_base` does: the workdir gix reports for a
-        // linked worktree comes from `.git/worktrees/<name>/gitdir`, which git writes as a
-        // realpath, so a symlinked component in `file` (macOS `/tmp`, a linked project
-        // directory) would otherwise never match it below.
-        let file = gix::path::realpath(&file).context("resolve symlinks")?;
-        let thread_safe_repo =
-            open_repo(get_repo_dir(&file)?, trust_full).context("Failed to open git repo")?;
+        let (file, thread_safe_repo) = open_repo_for_file(&file, trust_full)?;
         let repo = thread_safe_repo.to_thread_local();
         let head = repo.head()?.peel_to_commit()?.id;
 

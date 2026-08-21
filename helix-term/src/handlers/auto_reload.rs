@@ -9,11 +9,12 @@ use helix_core::file_watcher::{events_from_paths, EventType, FileSystemDidChange
 use helix_event::{dispatch, register_hook, send_blocking};
 use helix_view::editor::Config;
 use helix_view::events::ConfigDidChange;
-use helix_view::handlers::{AutoReloadEvent, BlameEvent, Handlers};
+use helix_view::handlers::{AutoReloadEvent, Handlers};
 use helix_view::{DocumentId, Editor};
 use tokio::time::Instant;
 
 use crate::compositor::Compositor;
+use crate::handlers::blame::request_blame;
 use crate::ui::{Prompt, PromptEvent};
 use crate::{job, ui};
 
@@ -47,12 +48,14 @@ impl ReloadHandler {
         let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
         job::dispatch_blocking(move |editor, compositor| {
             let mut vcs_reload = false;
+            let mut history_rewritten = false;
 
             for fs_event in &*fs_events {
                 // Renames (e.g. git committing a ref via <ref>.lock) surface as
                 // Create; those matter for the VCS state but not for buffers.
                 if matches!(fs_event.ty, EventType::Modified | EventType::Create) {
                     vcs_reload |= editor.diff_providers.needs_reload(fs_event);
+                    history_rewritten |= editor.diff_providers.rewrites_history(fs_event);
                 }
                 if fs_event.ty != EventType::Modified {
                     continue;
@@ -66,7 +69,7 @@ impl ReloadHandler {
             }
 
             if vcs_reload {
-                reload_vcs_diffs(editor);
+                reload_vcs_diffs(editor, history_rewritten);
             }
         });
     }
@@ -245,7 +248,9 @@ fn handle_document_change(
 }
 
 /// Reload VCS diffs for all documents
-fn reload_vcs_diffs(editor: &mut Editor) {
+/// Refresh every document's diff base and blame after the repository's refs moved.
+/// `history_rewritten` forces a new blame even where `HEAD` did not move (`git replace`).
+fn reload_vcs_diffs(editor: &mut Editor, history_rewritten: bool) {
     let auto_fetch = editor.config().inline_blame.auto_fetch;
     for doc in editor.documents.values_mut() {
         let Some(path) = doc.path().map(ToOwned::to_owned) else {
@@ -265,24 +270,19 @@ fn reload_vcs_diffs(editor: &mut Editor) {
         }
         // Blame maps lines to commits as of the HEAD it was computed against.
         // This watcher also fires for ref traffic that leaves HEAD alone (a
-        // fetch, tag or stash), so skip the expensive re-request unless HEAD
-        // really moved (commit, amend, reset, checkout). Then re-fetch under
-        // auto-fetch, or flag it so the next `blame_line` re-fetches instead
-        // of reporting the old mapping.
-        if matches!(&doc.file_blame, Some(Ok(blame)) if blame.is_current()) {
-            continue;
-        }
+        // fetch, tag or stash); `request_blame` keeps a blame that is still
+        // current unless history was rewritten in place. Without auto-fetch,
+        // flag the document so the next `blame_line` re-fetches instead of
+        // reporting the old mapping.
         if auto_fetch {
-            send_blocking(
-                &editor.handlers.blame,
-                BlameEvent {
-                    path,
-                    doc_id: doc.id(),
-                    line: None,
-                    trust_full,
-                },
+            let _ = request_blame(
+                &editor.handlers,
+                &editor.workspace_trust,
+                doc,
+                None,
+                history_rewritten,
             );
-        } else {
+        } else if history_rewritten || !doc.blame_is_current() {
             doc.is_blame_potentially_out_of_date = true;
         }
     }

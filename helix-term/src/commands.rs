@@ -3689,55 +3689,70 @@ fn insert_at_line_start(cx: &mut Context) {
 }
 
 pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_line: u32) {
-    let inline_blame_config = &editor.config().inline_blame;
+    use crate::handlers::blame::{request_blame, NotRequested};
+
+    enum Outcome {
+        Blame(String),
+        Status(String),
+        Error(String),
+    }
+
+    let inline_blame_config = editor.config().inline_blame.clone();
     let Some(doc) = editor.document(doc_id) else {
         return;
     };
-    let line_blame = match doc.line_blame(cursor_line, &inline_blame_config.format) {
-        result
-            if (result.is_ok() && doc.is_blame_potentially_out_of_date)
-                || matches!(result, Err(LineBlameError::NotReadyYet) if !inline_blame_config.auto_fetch) =>
-        {
-            if let Some(path) = doc.path() {
-                let trust_full = editor
-                    .workspace_trust
-                    .query(
-                        doc.workspace_root(),
-                        helix_loader::workspace_trust::TrustQuery::Git,
-                    )
-                    .is_trusted();
-                let tx = editor.handlers.blame.clone();
-                helix_event::send_blocking(
-                    &tx,
-                    helix_view::handlers::BlameEvent {
-                        path: path.to_path_buf(),
-                        doc_id: doc.id(),
-                        line: Some(cursor_line),
-                        trust_full,
-                    },
-                );
-                editor.set_status(format!("Requested blame for {}...", path.display()));
-                let doc = editor
-                    .document_mut(doc_id)
-                    .expect("exists since we return from the function earlier if it does not");
-                doc.is_blame_potentially_out_of_date = false;
-            } else {
-                editor.set_error("Could not get path of document");
-            };
-            return;
-        }
-        Ok(line_blame) => line_blame,
-        Err(err @ (LineBlameError::NotCommittedYet | LineBlameError::NotReadyYet)) => {
-            editor.set_status(err.to_string());
-            return;
-        }
-        Err(err @ LineBlameError::NoFileBlame(_, _)) => {
-            editor.set_error(err.to_string());
-            return;
-        }
+    let (needs_fetch, outcome) = match doc.line_blame(cursor_line, &inline_blame_config.format) {
+        Ok(blame) => (
+            doc.is_blame_potentially_out_of_date && !doc.blame_is_current(),
+            Outcome::Blame(blame),
+        ),
+        Err(err @ LineBlameError::NotReadyYet) => (
+            !inline_blame_config.auto_fetch,
+            Outcome::Status(err.to_string()),
+        ),
+        Err(err @ LineBlameError::NotCommittedYet) => (false, Outcome::Status(err.to_string())),
+        Err(err @ LineBlameError::NoFileBlame(..)) => (false, Outcome::Error(err.to_string())),
     };
 
-    editor.set_status(line_blame);
+    if needs_fetch {
+        match request_blame(
+            &editor.handlers,
+            &editor.workspace_trust,
+            doc,
+            Some(cursor_line),
+            false,
+        ) {
+            Ok(()) => {
+                let path = doc
+                    .path()
+                    .expect("request_blame succeeded, so the document has a path")
+                    .display()
+                    .to_string();
+                editor.set_status(format!("Requested blame for {path}..."));
+                editor
+                    .document_mut(doc_id)
+                    .expect("exists since we return from the function earlier if it does not")
+                    .is_blame_potentially_out_of_date = false;
+                return;
+            }
+            Err(NotRequested::NoPath) => {
+                editor.set_error("Could not get path of document");
+                return;
+            }
+            // HEAD has not moved since the blame was computed: it is still right.
+            Err(NotRequested::Current) => {}
+        }
+    }
+
+    if let Some(doc) = editor.document_mut(doc_id) {
+        if doc.is_blame_potentially_out_of_date && doc.blame_is_current() {
+            doc.is_blame_potentially_out_of_date = false;
+        }
+    }
+    match outcome {
+        Outcome::Blame(blame) | Outcome::Status(blame) => editor.set_status(blame),
+        Outcome::Error(err) => editor.set_error(err),
+    }
 }
 
 fn blame_line(cx: &mut Context) {

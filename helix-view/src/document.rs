@@ -803,6 +803,12 @@ impl Document {
         }
     }
 
+    /// Whether the blame this document holds was computed against the repository's
+    /// current `HEAD`. See [`helix_vcs::FileBlame::is_current`].
+    pub fn blame_is_current(&self) -> bool {
+        matches!(&self.file_blame, Some(Ok(blame)) if blame.is_current())
+    }
+
     pub fn should_request_full_file_blame(&mut self, auto_fetch: bool) -> bool {
         if auto_fetch {
             true
