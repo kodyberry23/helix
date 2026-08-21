@@ -549,6 +549,35 @@ mod tests {
         assert_eq!(next.line, Some(9), "asked for later, so it wins");
     }
 
+    /// The handover a stale landing performs (`Landing::StoreAndWait`): the landing
+    /// request's own line goes to the waiter, whose own line wins, while a line
+    /// deferred later than both stays deferred and beats either when the waiter lands.
+    #[test]
+    fn handover_keeps_a_deferred_line_ahead_of_the_waiter() {
+        let doc = DocumentId::default();
+        let mut queue = DocQueue::default();
+        queue.submit(request(Some(2))).expect("starts (own line 2)");
+        assert!(queue.submit(request(Some(9))).is_none(), "waiter, line 9");
+        queue.defer_answer(doc, Some(7));
+
+        // What `land` does on StoreAndWait, in order.
+        let deferred = queue.take_deferred(doc);
+        assert_eq!(deferred, Some(7));
+        queue.carry_to_waiter(doc, Some(2));
+        queue.defer_answer(doc, deferred);
+        let (next, _) = queue.finished(doc).expect("the waiter is promoted");
+        assert_eq!(
+            next.line,
+            Some(9),
+            "the waiter's own line beats the older one"
+        );
+        assert_eq!(
+            queue.take_deferred(doc),
+            Some(7),
+            "the line deferred last is still ahead of both"
+        );
+    }
+
     #[test]
     fn abandoning_a_document_drops_its_waiter_and_deferred_line() {
         let doc = DocumentId::default();
