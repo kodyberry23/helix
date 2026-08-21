@@ -100,12 +100,11 @@ pub fn for_each_changed_file(
     status(&open_repo(cwd, trust_full)?.to_thread_local(), f)
 }
 
-/// Get the path to the HEAD file for the git repository containing the given path.
-/// This properly handles both regular repositories and worktrees.
-/// Paths whose change means `HEAD` may have moved: the `HEAD` file, the branch it
-/// names and `packed-refs`. They are polled when they lie outside the watched
-/// workspace (the main repository of a linked worktree, a submodule's git dir under
-/// the superproject); the file watcher drops the ones inside it. Missing paths are
+/// Paths whose change means `HEAD` may have moved for the repository containing
+/// `path`: the `HEAD` file, the branch it names and `packed-refs`. They are polled
+/// when they lie outside the watched workspace (the main repository of a linked
+/// worktree; the superproject's `.git/modules/<name>` when a submodule checkout is
+/// the workspace); the file watcher drops the ones inside it. Missing paths are
 /// fine: they poll as absent and fire when they appear.
 pub fn get_watch_paths(path: &Path) -> Vec<PathBuf> {
     // Locating these files only reads the repository's directory layout, never

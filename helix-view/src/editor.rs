@@ -1509,6 +1509,14 @@ pub enum CloseError {
     SaveError(anyhow::Error),
 }
 
+/// Hand the VCS paths worth polling (those outside the watched workspace) to the
+/// file watcher. Free-standing so `Editor::new` can call it before `Self` exists.
+fn refresh_vcs_watch_paths(file_watcher: &mut Watcher, diff_providers: &mut DiffProviderRegistry) {
+    let (workspace, _) = helix_loader::find_workspace();
+    let extra_paths = diff_providers.get_watched_paths(&workspace);
+    file_watcher.set_extra_watched_paths(extra_paths);
+}
+
 impl Editor {
     pub fn new(
         mut area: Rect,
@@ -1526,10 +1534,7 @@ impl Editor {
         let mut file_watcher = Watcher::new(&conf.file_watcher);
         let mut diff_providers = DiffProviderRegistry::default();
 
-        // Set up extra watched paths from VCS providers (e.g., external HEAD files for worktrees)
-        let (workspace, _) = helix_loader::find_workspace();
-        let extra_paths = diff_providers.get_watched_paths(&workspace);
-        file_watcher.set_extra_watched_paths(extra_paths);
+        refresh_vcs_watch_paths(&mut file_watcher, &mut diff_providers);
 
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
@@ -1612,6 +1617,13 @@ impl Editor {
 
     pub fn config(&self) -> DynGuard<Config> {
         self.config.load()
+    }
+
+    /// Re-resolve the VCS paths polled outside the workspace (`HEAD`, the branch it
+    /// names, `packed-refs`). Call after the repository's refs changed: `HEAD` may
+    /// name another branch now.
+    pub fn refresh_vcs_watch_paths(&mut self) {
+        refresh_vcs_watch_paths(&mut self.file_watcher, &mut self.diff_providers);
     }
 
     /// Call if the config has changed to let the editor update all

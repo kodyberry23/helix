@@ -86,13 +86,7 @@ pub fn register_hooks(handlers: &Handlers) {
     // must be done here because the file watcher is in helix-core
     register_hook!(move |event: &mut ConfigDidChange<'_>| {
         event.editor.file_watcher.reload(&event.new.file_watcher);
-        // Update extra watched paths from VCS providers (e.g., external HEAD files for worktrees)
-        let (workspace, _) = helix_loader::find_workspace();
-        let extra_paths = event.editor.diff_providers.get_watched_paths(&workspace);
-        event
-            .editor
-            .file_watcher
-            .set_extra_watched_paths(extra_paths);
+        event.editor.refresh_vcs_watch_paths();
         Ok(())
     });
 }

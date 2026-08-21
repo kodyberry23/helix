@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, LazyLock},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -25,6 +25,10 @@ static BLAME_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
     Semaphore::new((cores / 2).max(1))
 });
 
+/// Per-document sequencing state, shared by the request hub, the hook and the
+/// tasks it spawns.
+static QUEUE: LazyLock<Mutex<DocQueue>> = LazyLock::new(Default::default);
+
 /// Whether git may be run with full trust for `doc`'s workspace
 pub fn git_trust_full(workspace_trust: &WorkspaceTrust, doc: &Document) -> bool {
     workspace_trust
@@ -43,11 +47,14 @@ pub enum NotRequested {
 
 /// Ask for `doc`'s blame.
 ///
-/// Every source of blame requests goes through here so the decision to skip work is
-/// made in one place: a blame already computed against the current `HEAD` is kept
-/// unless `force` is set by a caller that has already decided. `line` asks for that
-/// line's blame to be shown in the statusline when the result lands, which is how
-/// `blame_line` answers when it has to fetch first.
+/// Every source of blame requests goes through here so the decisions to skip work
+/// are made in one place: a blame already computed against the current `HEAD` is
+/// kept, and a blame already on its way for the document is left to finish (its
+/// landing answers `line`, or asks for a fresh one if `HEAD` moved meanwhile).
+/// `force` bypasses both, for the one caller that knows better: a result that just
+/// landed stale. `line` asks for that line's blame to be shown in the statusline
+/// once a usable blame lands, which is how `blame_line` answers when it has to
+/// fetch first.
 pub fn request_blame(
     handlers: &Handlers,
     doc: &Document,
@@ -58,8 +65,15 @@ pub fn request_blame(
     let Some(path) = doc.path() else {
         return Err(NotRequested::NoPath);
     };
-    if !force && doc.blame_is_current() {
-        return Err(NotRequested::Current);
+    if !force {
+        if doc.blame_is_current() {
+            return Err(NotRequested::Current);
+        }
+        let mut queue = QUEUE.lock();
+        if queue.in_flight(doc.id()) {
+            queue.defer_answer(doc.id(), line);
+            return Ok(());
+        }
     }
     helix_event::send_blocking(
         &handlers.blame,
@@ -89,8 +103,7 @@ struct Running {
     waiting: Option<BlameEvent>,
 }
 
-/// Per-document sequencing of blame computations, shared between the hook and
-/// the tasks it spawns.
+/// Per-document sequencing of blame computations.
 ///
 /// One blame runs at a time per document and results land in the order they were
 /// requested, so a result computed against an older `HEAD` can never overwrite a
@@ -100,6 +113,9 @@ struct Running {
 #[derive(Default)]
 struct DocQueue {
     running: HashMap<DocumentId, Running>,
+    /// Lines the user asked to see whose answer was deferred to a computation
+    /// still on its way, one per document
+    deferred_lines: HashMap<DocumentId, u32>,
     last_epoch: u64,
 }
 
@@ -146,6 +162,11 @@ impl DocQueue {
         }
     }
 
+    /// Whether a blame for `doc_id` is running or waiting
+    fn in_flight(&self, doc_id: DocumentId) -> bool {
+        self.running.contains_key(&doc_id)
+    }
+
     /// Whether a request newer than the computation `epoch` is running or waiting
     /// for `doc_id`. Stable whether or not [`Self::finished`] already ran for `epoch`.
     fn superseded(&self, doc_id: DocumentId, epoch: u64) -> bool {
@@ -153,6 +174,28 @@ impl DocQueue {
             .get(&doc_id)
             .is_some_and(|running| running.epoch != epoch || running.waiting.is_some())
     }
+
+    /// Remember `line` so the next usable blame that lands for `doc_id` answers it
+    fn defer_answer(&mut self, doc_id: DocumentId, line: Option<u32>) {
+        if let Some(line) = line {
+            self.deferred_lines.insert(doc_id, line);
+        }
+    }
+
+    /// The line to answer as a result lands: the request's own, or one deferred to it
+    fn take_answer(&mut self, doc_id: DocumentId, line: Option<u32>) -> Option<u32> {
+        let deferred = self.deferred_lines.remove(&doc_id);
+        line.or(deferred)
+    }
+}
+
+/// What the document holds when a result lands
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Nothing,
+    /// A blame computed against an earlier `HEAD`
+    Stale,
+    Current,
 }
 
 /// What to do with a blame result once it reaches the editor
@@ -169,17 +212,19 @@ enum Landing {
 }
 
 /// `result_current` is `None` for a failed blame, otherwise whether the blame still
-/// matches `HEAD`; `existing_current` says the same of the blame the document holds.
-fn landing(result_current: Option<bool>, existing_current: bool, superseded: bool) -> Landing {
-    match result_current {
-        Some(true) => Landing::Store,
+/// matches `HEAD`.
+fn landing(result_current: Option<bool>, held: Held, superseded: bool) -> Landing {
+    match (result_current, held) {
+        (Some(true), _) => Landing::Store,
         // A blame that is still current beats a failure, and one that never was.
-        _ if existing_current => Landing::Discard,
-        None => Landing::Store,
+        (_, Held::Current) => Landing::Discard,
+        // A failure replaces nothing; a stale mapping is better than an error.
+        (None, Held::Stale) => Landing::Discard,
+        (None, Held::Nothing) => Landing::Store,
         // HEAD moved on while this blame ran (a rebase or checkout, possibly undone
-        // since). Better than nothing until the newer one lands.
-        Some(false) if superseded => Landing::StoreAndWait,
-        Some(false) => Landing::StoreAndRefetch,
+        // since). Better than nothing until a current one lands.
+        (Some(false), _) if superseded => Landing::StoreAndWait,
+        (Some(false), _) => Landing::StoreAndRefetch,
     }
 }
 
@@ -191,7 +236,6 @@ pub struct BlameHandler {
     /// events costs one blame per document rather than one per event, and no
     /// document is lost.
     pending: HashMap<DocumentId, BlameEvent>,
-    queue: Arc<Mutex<DocQueue>>,
 }
 
 impl AsyncHook for BlameHandler {
@@ -213,9 +257,9 @@ impl AsyncHook for BlameHandler {
     fn finish_debounce(&mut self) {
         for (_, event) in self.pending.drain() {
             // Bound before the `if`, so the lock is not held while spawning.
-            let started = self.queue.lock().submit(event);
+            let started = QUEUE.lock().submit(event);
             if let Some((event, epoch)) = started {
-                spawn_blame(Arc::clone(&self.queue), event, epoch);
+                spawn_blame(event, epoch);
             }
         }
     }
@@ -223,7 +267,7 @@ impl AsyncHook for BlameHandler {
 
 /// Compute one blame off the main thread, hand the result to the editor, then start
 /// the request that arrived for the same document while this one ran, if any.
-fn spawn_blame(queue: Arc<Mutex<DocQueue>>, event: BlameEvent, epoch: u64) {
+fn spawn_blame(event: BlameEvent, epoch: u64) {
     tokio::spawn(async move {
         let BlameEvent {
             path,
@@ -242,26 +286,53 @@ fn spawn_blame(queue: Arc<Mutex<DocQueue>>, event: BlameEvent, epoch: u64) {
             }
             Err(_) => Err(anyhow::anyhow!("blame queue closed")),
         };
-        let queue_at_landing = Arc::clone(&queue);
         job::dispatch(move |editor, _| {
             let auto_fetch = editor.config().inline_blame.auto_fetch;
             let Some(doc) = editor.document_mut(doc_id) else {
                 return;
             };
             let result_current = result.as_ref().ok().map(FileBlame::is_current);
-            let superseded = queue_at_landing.lock().superseded(doc_id, epoch);
-            match landing(result_current, doc.blame_is_current(), superseded) {
-                Landing::Discard => {}
+            let held = match &doc.file_blame {
+                Some(Ok(blame)) if blame.is_current() => Held::Current,
+                Some(Ok(_)) => Held::Stale,
+                _ => Held::Nothing,
+            };
+            let (superseded, line) = {
+                let mut queue = QUEUE.lock();
+                (
+                    queue.superseded(doc_id, epoch),
+                    queue.take_answer(doc_id, line),
+                )
+            };
+            let failure = result
+                .as_ref()
+                .err()
+                .map(|err| format!("Blame failed: {err:#}"));
+            match landing(result_current, held, superseded) {
                 Landing::Store => doc.file_blame = Some(result),
+                Landing::Discard => {
+                    // A failure is reported, never retried from here: that could
+                    // loop while the repository stays broken.
+                    if let Some(failure) = failure {
+                        if line.is_some() {
+                            editor.set_error(failure);
+                        } else {
+                            log::warn!("{failure}; keeping the previous blame");
+                        }
+                        return;
+                    }
+                }
                 Landing::StoreAndWait => {
                     doc.file_blame = Some(result);
+                    QUEUE.lock().defer_answer(doc_id, line);
                     return;
                 }
                 Landing::StoreAndRefetch => {
                     doc.file_blame = Some(result);
+                    QUEUE.lock().defer_answer(doc_id, line);
                     if let Some(doc) = editor.document(doc_id) {
                         let trust_full = git_trust_full(&editor.workspace_trust, doc);
-                        let _ = request_blame(&editor.handlers, doc, trust_full, line, true);
+                        let _ = request_blame(&editor.handlers, doc, trust_full, None, true);
                     }
                     return;
                 }
@@ -270,14 +341,17 @@ fn spawn_blame(queue: Arc<Mutex<DocQueue>>, event: BlameEvent, epoch: u64) {
             if let Some(line) = line {
                 crate::commands::blame_line_impl(editor, doc_id, line);
             } else if !auto_fetch {
-                editor.set_status("Blame for this file is now available")
+                match failure {
+                    Some(failure) => editor.set_error(failure),
+                    None => editor.set_status("Blame for this file is now available"),
+                }
             }
         })
         .await;
         // Queued after this result's dispatch, so the next result lands after it.
-        let next = queue.lock().finished(doc_id);
+        let next = QUEUE.lock().finished(doc_id);
         if let Some((next, epoch)) = next {
-            spawn_blame(queue, next, epoch);
+            spawn_blame(next, epoch);
         }
     });
 }
@@ -295,7 +369,7 @@ pub(super) fn register_hooks(_handlers: &Handlers) {
     register_hook!(move |event: &mut ConfigDidChange<'_>| {
         if !event.old.inline_blame.auto_fetch && event.new.inline_blame.auto_fetch {
             // Fetch for every open document; those whose blame is already
-            // current are skipped by `request_blame`.
+            // current or on its way are skipped by `request_blame`.
             for doc in event.editor.documents() {
                 let trust_full = git_trust_full(&event.editor.workspace_trust, doc);
                 let _ = request_blame(&event.editor.handlers, doc, trust_full, None, false);
@@ -342,7 +416,9 @@ mod tests {
     fn one_blame_at_a_time_per_document_and_only_the_newest_waits() {
         let doc = DocumentId::default();
         let mut queue = DocQueue::default();
+        assert!(!queue.in_flight(doc));
         let (_, first) = queue.submit(request(Some(1))).expect("idle: starts now");
+        assert!(queue.in_flight(doc));
         assert!(queue.submit(request(Some(2))).is_none(), "busy: waits");
         assert!(queue.submit(request(Some(3))).is_none(), "busy: replaces 2");
         assert!(queue.submit(request(None)).is_none(), "busy: replaces 3");
@@ -367,6 +443,7 @@ mod tests {
             queue.finished(doc).is_none(),
             "nothing was waiting behind it"
         );
+        assert!(!queue.in_flight(doc), "idle: nothing runs or waits");
         assert!(!queue.superseded(doc, second), "idle: nothing newer exists");
         let (_, third) = queue.submit(request(Some(4))).expect("idle again");
         assert!(
@@ -379,19 +456,50 @@ mod tests {
     }
 
     #[test]
+    fn deferred_lines_are_answered_by_the_next_landing() {
+        let doc = DocumentId::default();
+        let mut queue = DocQueue::default();
+        assert_eq!(queue.take_answer(doc, None), None);
+        queue.defer_answer(doc, None);
+        assert_eq!(queue.take_answer(doc, None), None, "nothing to defer");
+        queue.defer_answer(doc, Some(7));
+        assert_eq!(
+            queue.take_answer(doc, Some(2)),
+            Some(2),
+            "the landing request's own line wins"
+        );
+        assert_eq!(
+            queue.take_answer(doc, None),
+            None,
+            "and consumes the deferred one"
+        );
+        queue.defer_answer(doc, Some(7));
+        assert_eq!(queue.take_answer(doc, None), Some(7));
+        assert_eq!(queue.take_answer(doc, None), None, "answered once");
+    }
+
+    #[test]
     fn landing_rules() {
+        use Held::*;
         // Current result: always stored.
-        assert_eq!(landing(Some(true), false, false), Landing::Store);
-        assert_eq!(landing(Some(true), true, true), Landing::Store);
+        assert_eq!(landing(Some(true), Nothing, false), Landing::Store);
+        assert_eq!(landing(Some(true), Current, true), Landing::Store);
         // A current blame in the document beats a failure or a stale result.
-        assert_eq!(landing(None, true, false), Landing::Discard);
-        assert_eq!(landing(Some(false), true, false), Landing::Discard);
-        assert_eq!(landing(Some(false), true, true), Landing::Discard);
-        // Nothing current to keep: a failure is shown as such.
-        assert_eq!(landing(None, false, false), Landing::Store);
-        assert_eq!(landing(None, false, true), Landing::Store);
-        // Stale with nothing better: wait for the newer request, else ask for one.
-        assert_eq!(landing(Some(false), false, true), Landing::StoreAndWait);
-        assert_eq!(landing(Some(false), false, false), Landing::StoreAndRefetch);
+        assert_eq!(landing(None, Current, false), Landing::Discard);
+        assert_eq!(landing(Some(false), Current, false), Landing::Discard);
+        assert_eq!(landing(Some(false), Current, true), Landing::Discard);
+        // A failure never displaces a usable mapping; with nothing held it is shown.
+        assert_eq!(landing(None, Stale, false), Landing::Discard);
+        assert_eq!(landing(None, Stale, true), Landing::Discard);
+        assert_eq!(landing(None, Nothing, false), Landing::Store);
+        assert_eq!(landing(None, Nothing, true), Landing::Store);
+        // Stale with nothing current: wait for the newer request, else ask for one.
+        assert_eq!(landing(Some(false), Nothing, true), Landing::StoreAndWait);
+        assert_eq!(landing(Some(false), Stale, true), Landing::StoreAndWait);
+        assert_eq!(
+            landing(Some(false), Nothing, false),
+            Landing::StoreAndRefetch
+        );
+        assert_eq!(landing(Some(false), Stale, false), Landing::StoreAndRefetch);
     }
 }

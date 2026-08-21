@@ -222,16 +222,24 @@ impl Watcher {
     /// Only paths outside the workspace are added (paths inside are already watched).
     pub fn set_extra_watched_paths(&mut self, paths: Vec<PathBuf>) {
         let (workspace, _) = helix_loader::find_workspace();
+        // The paths arrive canonical; compare against the canonical workspace.
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let previous = std::mem::take(&mut self.extra_watched_paths);
         self.extra_watched_paths = paths
             .into_iter()
             .filter(|path| !path.starts_with(&workspace))
             .map(|path| {
-                let mtime = path.metadata().ok().and_then(|m| m.modified().ok());
+                // Keep the baseline of a path already tracked: re-resolving the set
+                // must not absorb a change that landed since the last poll.
+                let mtime = match previous.iter().find(|(known, _)| *known == path) {
+                    Some((_, mtime)) => *mtime,
+                    None => path.metadata().ok().and_then(|m| m.modified().ok()),
+                };
                 (path, mtime)
             })
             .collect();
         if !self.extra_watched_paths.is_empty() {
-            log::info!(
+            log::debug!(
                 "added {} extra paths for polling: {:?}",
                 self.extra_watched_paths.len(),
                 self.extra_watched_paths

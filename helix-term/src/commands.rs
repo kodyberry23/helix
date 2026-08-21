@@ -3716,8 +3716,7 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
 
     if needs_fetch {
         let trust_full = git_trust_full(&editor.workspace_trust, doc);
-        // Decided above, so `request_blame` must not second-guess it.
-        match request_blame(&editor.handlers, doc, trust_full, Some(cursor_line), true) {
+        match request_blame(&editor.handlers, doc, trust_full, Some(cursor_line), false) {
             Ok(()) => {
                 let path = doc
                     .path()
@@ -3735,7 +3734,7 @@ pub(crate) fn blame_line_impl(editor: &mut Editor, doc_id: DocumentId, cursor_li
                 editor.set_error("Could not get path of document");
                 return;
             }
-            // Cannot happen for a forced request; showing what we have is the safe fallback.
+            // Current after all: show what we have.
             Err(NotRequested::Current) => {}
         }
     }

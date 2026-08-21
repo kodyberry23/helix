@@ -85,6 +85,7 @@ impl DiffProviderRegistry {
             .providers
             .iter()
             .flat_map(|provider| provider.get_watched_paths(workspace))
+            .map(|path| canonical_best_effort(&path))
             .collect();
         self.polled.clone()
     }
@@ -129,6 +130,30 @@ impl Default for DiffProviderRegistry {
 /// A union type that includes all types that implement [DiffProvider]. We need this type to allow
 /// cloning [DiffProviderRegistry] as `Clone` cannot be used in trait objects.
 ///
+/// Canonical form of `path`, for comparison with the file watcher's events, which
+/// are canonical (`/tmp` is a symlink on macOS, project directories often are).
+/// The path itself may not exist yet (the ref of an unborn branch), so the longest
+/// existing prefix is resolved and the rest appended.
+fn canonical_best_effort(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(canonical) = base.canonicalize() {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |acc, name| acc.join(name));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                base = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// `Copy` is simply to ensure the `clone()` call is the simplest it can be.
 #[derive(Copy, Clone, Debug)]
 enum DiffProvider {
@@ -248,6 +273,26 @@ mod tests {
             ty: EventType::Modified,
         };
         assert!(!provider.needs_reload(&event));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_best_effort_resolves_the_existing_prefix() {
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir(real.path().join("refs")).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let real_refs = real.path().join("refs").canonicalize().unwrap();
+        let missing = link.join("refs").join("heads").join("unborn");
+        assert_eq!(
+            canonical_best_effort(&missing),
+            real_refs.join("heads").join("unborn"),
+            "symlinks in the existing prefix are resolved, the missing tail is kept"
+        );
+        let existing = link.join("refs");
+        assert_eq!(canonical_best_effort(&existing), real_refs);
     }
 
     #[cfg(feature = "git")]

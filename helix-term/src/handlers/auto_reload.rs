@@ -272,9 +272,7 @@ fn reload_vcs_diffs(editor: &mut Editor) {
     }
     // HEAD may now name another branch: re-resolve the paths polled outside the
     // workspace so commits on it are seen too.
-    let (workspace, _) = helix_loader::find_workspace();
-    let extra_paths = editor.diff_providers.get_watched_paths(&workspace);
-    editor.file_watcher.set_extra_watched_paths(extra_paths);
+    editor.refresh_vcs_watch_paths();
 }
 
 /// Shows a prompt asking the user whether to reload a modified document.
