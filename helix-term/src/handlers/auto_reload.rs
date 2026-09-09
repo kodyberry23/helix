@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use helix_core::file_watcher::{events_from_paths, EventType, FileSystemDidChange};
 use helix_event::{dispatch, register_hook, send_blocking};
+use helix_lsp::lsp;
 use helix_view::editor::Config;
 use helix_view::events::ConfigDidChange;
 use helix_view::handlers::{AutoReloadEvent, Handlers};
@@ -50,6 +51,8 @@ impl ReloadHandler {
         let prompt_if_modified = self.prompt_if_modified.load(atomic::Ordering::Relaxed);
         job::dispatch_blocking(move |editor, compositor| {
             let mut vcs_reload = false;
+            // Changed files no buffer holds, for the language servers.
+            let mut unopened: Vec<PathBuf> = Vec::new();
 
             for fs_event in &*fs_events {
                 // Renames (e.g. git committing a ref via <ref>.lock) surface as
@@ -61,16 +64,25 @@ impl ReloadHandler {
                 ) {
                     vcs_reload |= editor.diff_providers.needs_reload(fs_event);
                 }
+                let path = fs_event.path.as_std_path();
+                let Some(doc_id) = editor.document_id_by_path(path) else {
+                    // A program that writes a temp file and renames it over
+                    // the target shows up as Create, not Modified.
+                    if matches!(fs_event.ty, EventType::Modified | EventType::Create)
+                        && !unopened.iter().any(|seen| seen == path)
+                    {
+                        unopened.push(path.to_path_buf());
+                    }
+                    continue;
+                };
                 if fs_event.ty != EventType::Modified {
                     continue;
                 }
 
-                let Some(doc_id) = editor.document_id_by_path(fs_event.path.as_std_path()) else {
-                    continue;
-                };
-
                 handle_document_change(editor, compositor, doc_id, prompt_if_modified);
             }
+
+            recheck_unopened(editor, &unopened);
 
             if vcs_reload {
                 reload_vcs_diffs(editor);
@@ -242,6 +254,80 @@ fn handle_document_change(
                 editor.set_error(msg);
             }
         }
+    }
+}
+
+/// rust-analyzer's `rust-analyzer/runFlycheck` notification: re-run cargo
+/// check for the workspace containing `text_document` (all of them if
+/// omitted). Resolved through the server's own file index, so the file
+/// need not be open.
+enum RunFlycheck {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunFlycheckParams {
+    text_document: Option<lsp::TextDocumentIdentifier>,
+}
+
+impl lsp::notification::Notification for RunFlycheck {
+    type Params = RunFlycheckParams;
+    const METHOD: &'static str = "rust-analyzer/runFlycheck";
+}
+
+/// Files changed on disk that no buffer holds: ask the language servers that
+/// would care to re-check them.
+///
+/// Every server already learns of the change through `didChangeWatchedFiles`,
+/// and most re-diagnose from that. rust-analyzer is the exception: its cargo
+/// check (where most of its errors come from) runs on `didSave`, and it
+/// deliberately ignores watched-file changes inside its workspace, expecting
+/// them to arrive as saves from the editor. An edit by another program never
+/// does, so its diagnostics for that file (gutter, picker, sidebar) would
+/// stand until the next save of anything. Its own notification for this,
+/// `rust-analyzer/runFlycheck`, is the documented way to ask.
+///
+/// Only files whose language lists the server are sent, so writes by cargo
+/// itself (`Cargo.lock` is TOML, `target/` is ignored and unwatched) cannot
+/// start a check that starts another. The editor's own saves are open
+/// documents and never reach here. One notification per server per batch:
+/// a single file names the workspace to check, several (a checkout, a
+/// formatter run) ask for all of them, rather than restarting the check
+/// once per file.
+fn recheck_unopened(editor: &Editor, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let loader = editor.syn_loader.load();
+    for client in editor.language_servers.iter_clients() {
+        if client.name() != "rust-analyzer" || !client.is_initialized() {
+            continue;
+        }
+        // Watcher paths are canonical; the root may have been given through
+        // a symlink (macOS /tmp, a linked checkout).
+        let root = client.root_path();
+        let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut changed = paths.iter().filter(|path| {
+            (path.starts_with(root) || path.starts_with(&real_root))
+                && loader.language_for_filename(path).is_some_and(|language| {
+                    loader
+                        .language(language)
+                        .config()
+                        .language_servers
+                        .iter()
+                        .any(|server| server.name == client.name())
+                })
+        });
+        let Some(first) = changed.next() else {
+            continue;
+        };
+        let text_document = if changed.next().is_some() {
+            None
+        } else {
+            lsp::Url::from_file_path(first)
+                .ok()
+                .map(lsp::TextDocumentIdentifier::new)
+        };
+        client.notify::<RunFlycheck>(RunFlycheckParams { text_document });
     }
 }
 

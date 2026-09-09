@@ -277,6 +277,11 @@ impl Client {
         &self.name
     }
 
+    /// The workspace root this server was started in.
+    pub fn root_path(&self) -> &std::path::Path {
+        &self.root_path
+    }
+
     pub fn id(&self) -> LanguageServerId {
         self.id
     }

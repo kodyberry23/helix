@@ -1379,6 +1379,24 @@ impl Document {
         self.pickup_last_saved_time();
         self.detect_indent_and_line_ending();
 
+        // Local patch: to a language server a reload of changed content is a
+        // save. The buffer now equals the file on disk, which changed, and
+        // `apply` only told the servers about the content (didChange).
+        // Servers that work on save (rust-analyzer's cargo check,
+        // build-on-save servers) would otherwise keep the diagnostics of the
+        // old file: rust-analyzer deliberately does not re-check on
+        // watched-file changes inside its workspace, expecting the editor's
+        // didSave instead. Same content (a touch, a `:reload` for its own
+        // sake) tells them nothing new.
+        if !transaction.changes().is_empty() {
+            let identifier = self.identifier();
+            for language_server in self.language_servers.values() {
+                if language_server.is_initialized() {
+                    language_server.text_document_did_save(identifier.clone(), self.text());
+                }
+            }
+        }
+
         match provider_registry.get_diff_base(&path, trust_full) {
             Some(diff_base) => self.set_diff_base(diff_base),
             None => self.diff_handle = None,
