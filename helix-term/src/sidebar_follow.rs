@@ -18,7 +18,12 @@
 //! in order; `sender` names this process, so a restarted editor is taken as
 //! is rather than having to outrun the old one's count. The latest snapshot
 //! is also sent with every reveal, so a sidebar restarted later catches up
-//! at the next buffer switch.
+//! at the next buffer switch. On exit the editor flushes any snapshot still
+//! queued and appends a farewell (`diagnostics-bye <sender> <seq>`) to it on
+//! the same connection: an empty snapshot the sidebar applies only if this
+//! editor's snapshot is the one on display, so a file whose fix the language
+//! server never got to report does not stay marked after the editor is gone
+//! (and a second editor sharing the sidebar keeps its own markers).
 //!
 //! Why a render() poll and not a DocumentFocusLost/DocumentDidOpen hook:
 //! event coverage is incomplete — `Editor::close` and
@@ -33,7 +38,8 @@
 //! All socket writes happen on one long-lived sender thread, in order, fed
 //! through a latest-wins slot (a stalled sidebar cannot make anything queue
 //! up), and failures are ignored — a missing, stale, or wedged sidebar must
-//! never affect the editor.
+//! never affect the editor. That includes quitting: the wait for the farewell
+//! is bounded (`SHUTDOWN_FLUSH`), and it runs after the terminal is restored.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
@@ -56,6 +62,11 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// bound its socket. A sidebar that hasn't bound within this window is not
 /// coming; later sends still fire on every buffer change as usual.
 const RETRY_DEADLINE: Duration = Duration::from_secs(30);
+/// How long `Drop` waits for the farewell to go out. One connect and one
+/// short write to a local socket take well under a millisecond; this is only
+/// ever spent in full when the sidebar is wedged, and by then the terminal is
+/// already restored, so the worst case is a late shell prompt.
+const SHUTDOWN_FLUSH: Duration = Duration::from_millis(250);
 
 /// Error and warning counts per file, for the files that have any.
 type DiagnosticSummary = BTreeMap<PathBuf, (u32, u32)>;
@@ -66,14 +77,33 @@ type DiagnosticSummary = BTreeMap<PathBuf, (u32, u32)>;
 struct Pending {
     reveal: Option<PathBuf>,
     snapshot: Option<(u64, Arc<DiagnosticSummary>)>,
+    /// Farewell to write on the way out: the sequence to retract at.
+    bye: Option<u64>,
     /// The editor is shutting down: let the sender thread finish.
     closed: bool,
+    /// Set by the sender thread on every exit path, so the bounded wait in
+    /// `Drop` ends as soon as the flush is done (or the thread is gone).
+    finished: bool,
 }
 
 /// Hand-off between the render loop and the sender thread.
 struct Outbox {
     pending: Mutex<Pending>,
+    /// There is work, or the editor is closing (the sender thread waits).
     wake: Condvar,
+    /// The sender thread has finished (`Drop` waits). Separate from `wake`
+    /// so `put`'s `notify_one` can never be delivered to `Drop` instead.
+    done: Condvar,
+}
+
+impl Outbox {
+    fn new() -> Self {
+        Outbox {
+            pending: Mutex::new(Pending::default()),
+            wake: Condvar::new(),
+            done: Condvar::new(),
+        }
+    }
 }
 
 impl Outbox {
@@ -114,25 +144,28 @@ pub struct SidebarFollow {
 
 impl SidebarFollow {
     pub fn from_env() -> Self {
+        Self::new(
+            std::env::var_os("TREELIX_SOCKET_PATH")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+        )
+    }
+
+    /// `None` disables the feature entirely.
+    fn new(socket: Option<PathBuf>) -> Self {
         let ready = Arc::new(AtomicBool::new(false));
-        let outbox = std::env::var_os("TREELIX_SOCKET_PATH")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .and_then(|socket| {
-                let outbox = Arc::new(Outbox {
-                    pending: Mutex::new(Pending::default()),
-                    wake: Condvar::new(),
-                });
-                let ready = Arc::clone(&ready);
-                let inbox = Arc::clone(&outbox);
-                // `Builder::spawn` reports failure instead of panicking, so a
-                // system that cannot give us a thread just loses the feature.
-                std::thread::Builder::new()
-                    .name("sidebar-follow".into())
-                    .spawn(move || sender_loop(socket, inbox, ready))
-                    .ok()
-                    .map(|_| outbox)
-            });
+        let outbox = socket.and_then(|socket| {
+            let outbox = Arc::new(Outbox::new());
+            let ready = Arc::clone(&ready);
+            let inbox = Arc::clone(&outbox);
+            // `Builder::spawn` reports failure instead of panicking, so a
+            // system that cannot give us a thread just loses the feature.
+            std::thread::Builder::new()
+                .name("sidebar-follow".into())
+                .spawn(move || sender_loop(socket, inbox, ready))
+                .ok()
+                .map(|_| outbox)
+        });
         SidebarFollow {
             outbox,
             revealed: None,
@@ -201,7 +234,11 @@ impl SidebarFollow {
             return;
         }
         self.fingerprint = fingerprint;
-        let summary = summarize(&editor.diagnostics);
+        self.queue_snapshot(summarize(&editor.diagnostics));
+    }
+
+    /// Bump the sequence and queue `summary`, unless it is what was last sent.
+    fn queue_snapshot(&mut self, summary: DiagnosticSummary) {
         if self.seq > 0 && summary == *self.snapshot {
             return;
         }
@@ -229,18 +266,46 @@ impl SidebarFollow {
 
 impl Drop for SidebarFollow {
     fn drop(&mut self) {
-        if let Some(outbox) = &self.outbox {
-            outbox.put(|pending| pending.closed = true);
-        }
+        let Some(outbox) = &self.outbox else {
+            return;
+        };
+        // Nothing to retract if this editor never claimed the sidebar.
+        let bye = (self.seq > 0).then(|| self.seq + 1);
+        let Ok(mut pending) = outbox.pending.lock() else {
+            return;
+        };
+        // A reveal from a dying editor would move the sidebar's highlight to
+        // a file nobody is editing, and cost a connect out of the budget.
+        pending.reveal = None;
+        pending.bye = bye;
+        pending.closed = true;
+        outbox.wake.notify_one();
+        // Bounded, so a wedged sidebar cannot delay quitting, and never
+        // unwrapped, since a panic here would abort during unwinding.
+        // `wait_timeout_while` re-waits with the remaining time on spurious
+        // wakeups instead of restarting the budget.
+        let _ = outbox
+            .done
+            .wait_timeout_while(pending, SHUTDOWN_FLUSH, |pending| !pending.finished);
     }
 }
 
 /// The sender thread: takes whatever is pending (latest reveal, latest
 /// snapshot), writes them one at a time, reveal first, and waits for more.
+/// When the editor closes, the snapshot and farewell still pending go out
+/// together, and `Drop` is told the thread is done however it ends.
 fn sender_loop(socket: PathBuf, outbox: Arc<Outbox>, ready: Arc<AtomicBool>) {
+    send_until_closed(&socket, &outbox, &ready);
+    if let Ok(mut pending) = outbox.pending.lock() {
+        pending.finished = true;
+    }
+    outbox.done.notify_all();
+}
+
+fn send_until_closed(socket: &Path, outbox: &Outbox, ready: &AtomicBool) {
     let sender = sender_id();
     loop {
-        let (reveal, snapshot) = {
+        let (reveal, snapshot, bye, closing) = {
             let Ok(mut pending) = outbox.pending.lock() else {
                 return;
             };
@@ -251,24 +316,44 @@ fn sender_loop(socket: PathBuf, outbox: Arc<Outbox>, ready: Arc<AtomicBool>) {
                 };
             }
             if pending.closed {
-                return;
+                // Closing: the latest snapshot, then the farewell, never a
+                // reveal (`Drop` already cleared it).
+                (None, pending.snapshot.take(), pending.bye.take(), true)
+            } else {
+                (pending.reveal.take(), pending.snapshot.take(), None, false)
             }
-            (pending.reveal.take(), pending.snapshot.take())
         };
         if let Some(path) = reveal {
             // Only a reveal that went through proves the sidebar is up and
             // pointed at us; the startup retry keys off this.
-            if write(&socket, &format!("reveal-follow {}\n", path.display())) {
+            if write(socket, &format!("reveal-follow {}\n", path.display())) {
                 ready.store(true, Ordering::Relaxed);
             }
         }
+        // One connection for both: the sidebar reads a connection on one
+        // thread, in order, so the farewell can never overtake the snapshot
+        // it is meant to follow.
+        let mut payload = String::new();
         if let Some((seq, files)) = snapshot {
-            write(&socket, &snapshot_payload(&sender, seq, &files));
+            payload.push_str(&snapshot_payload(&sender, seq, &files));
+        }
+        if let Some(seq) = bye {
+            payload.push_str(&bye_payload(&sender, seq));
+        }
+        if !payload.is_empty() {
+            write(socket, &payload);
+        }
+        if closing {
+            return;
         }
     }
 }
 
-/// One connection, one payload; true when it went through.
+/// One connection, one payload; true when it went through. The connect has
+/// no timeout (std's unix sockets offer none; `socket2::Socket::connect_timeout`
+/// would be the way if it ever matters): it fails at once when nothing
+/// listens, and only blocks when a live listener's backlog is full, which the
+/// bounded wait in `Drop` covers.
 fn write(socket: &Path, payload: &str) -> bool {
     use std::io::Write as _;
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
@@ -289,6 +374,12 @@ fn sender_id() -> String {
             .unwrap_or(0)
     });
     format!("hx-{}-{start}", std::process::id())
+}
+
+/// The wire form of one farewell: an empty snapshot at `seq` that only its
+/// own sender's display may apply.
+fn bye_payload(sender: &str, seq: u64) -> String {
+    format!("diagnostics-bye {sender} {seq}\n")
 }
 
 /// A newline in a file name would smuggle a second line into the
@@ -452,14 +543,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bye_payload_is_one_line() {
+        assert_eq!(bye_payload("hx-1-2", 8), "diagnostics-bye hx-1-2 8\n");
+    }
+
+    /// A listener on a short socket path (macOS caps `sun_path` at 104
+    /// bytes, which `$TMPDIR` alone nearly fills) collecting every line with
+    /// the index of the connection it arrived on.
+    struct Sidebar {
+        socket: PathBuf,
+        lines: Arc<Mutex<Vec<(usize, String)>>>,
+    }
+
+    impl Sidebar {
+        fn listen(tag: &str) -> Self {
+            let socket = PathBuf::from(format!("/tmp/hx-sf-{}-{tag}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&lines);
+            std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                for (index, stream) in listener.incoming().enumerate() {
+                    let Ok(stream) = stream else { break };
+                    for line in std::io::BufReader::new(stream).lines() {
+                        let Ok(line) = line else { break };
+                        sink.lock().unwrap().push((index, line));
+                    }
+                }
+            });
+            Sidebar { socket, lines }
+        }
+
+        fn wait_for(&self, count: usize) -> Vec<(usize, String)> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let lines = self.lines.lock().unwrap().clone();
+                if lines.len() >= count || Instant::now() > deadline {
+                    return lines;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for Sidebar {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    fn one_file() -> DiagnosticSummary {
+        let mut files = DiagnosticSummary::new();
+        files.insert(PathBuf::from("/r/a.rs"), (1, 0));
+        files
+    }
+
+    #[test]
+    fn exit_flushes_the_pending_snapshot_and_the_farewell_together() {
+        let sidebar = Sidebar::listen("flush");
+        let mut follow = SidebarFollow::new(Some(sidebar.socket.clone()));
+        follow.queue_snapshot(one_file());
+        drop(follow);
+        let lines = sidebar.wait_for(4);
+        let sender = sender_id();
+        assert_eq!(
+            lines,
+            vec![
+                (0, format!("diagnostics-begin {sender} 1")),
+                (0, "diagnostics 1 0 /r/a.rs".to_string()),
+                (0, "diagnostics-end 1".to_string()),
+                (0, format!("diagnostics-bye {sender} 2")),
+            ],
+            "in order, on one connection"
+        );
+    }
+
+    #[test]
+    fn exit_sends_nothing_when_no_snapshot_was_ever_claimed() {
+        let sidebar = Sidebar::listen("silent");
+        drop(SidebarFollow::new(Some(sidebar.socket.clone())));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sidebar.lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_sends_the_snapshot_and_farewell_but_never_a_reveal() {
+        let sidebar = Sidebar::listen("reveal");
+        let follow = SidebarFollow::new(Some(sidebar.socket.clone()));
+        let outbox = Arc::clone(follow.outbox.as_ref().unwrap());
+        // Everything at once, so the sender thread sees the close and the
+        // pending items together (Drop clears the reveal itself; this is the
+        // sender side's own guarantee).
+        outbox.put(|pending| {
+            pending.reveal = Some(PathBuf::from("/r/a.rs"));
+            pending.snapshot = Some((1, Arc::new(one_file())));
+            pending.bye = Some(2);
+            pending.closed = true;
+        });
+        // Not dropped: Drop would race the sender thread for the same slots.
+        std::mem::forget(follow);
+        let lines = sidebar.wait_for(4);
+        let sender = sender_id();
+        assert_eq!(
+            lines,
+            vec![
+                (0, format!("diagnostics-begin {sender} 1")),
+                (0, "diagnostics 1 0 /r/a.rs".to_string()),
+                (0, "diagnostics-end 1".to_string()),
+                (0, format!("diagnostics-bye {sender} 2")),
+            ]
+        );
+        let pending = outbox.pending.lock().unwrap();
+        assert!(pending.finished, "the sender thread reports it is done");
+    }
+
+    #[test]
+    fn exit_does_not_wait_for_a_sidebar_that_is_not_there() {
+        let socket = PathBuf::from(format!("/tmp/hx-sf-{}-absent.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let mut follow = SidebarFollow::new(Some(socket));
+        follow.queue_snapshot(one_file());
+        let outbox = Arc::clone(follow.outbox.as_ref().unwrap());
+        let started = Instant::now();
+        drop(follow);
+        assert!(
+            outbox.pending.lock().unwrap().finished,
+            "the wait ended because the sender thread reported done, not by timing out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "no hang");
+    }
+
     /// The outbox keeps only the latest of each kind, so a stalled sidebar
     /// can never make writes pile up.
     #[test]
     fn the_outbox_is_latest_wins() {
-        let outbox = Outbox {
-            pending: Mutex::new(Pending::default()),
-            wake: Condvar::new(),
-        };
+        let outbox = Outbox::new();
         let files = Arc::new(DiagnosticSummary::new());
         for seq in 1..=3 {
             let files = Arc::clone(&files);
