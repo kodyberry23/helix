@@ -93,6 +93,9 @@ pub struct Application {
     // the treelix sidebar on change. See crate::sidebar_follow.
     #[cfg(unix)]
     sidebar_follow: crate::sidebar_follow::SidebarFollow,
+
+    /// Set on SIGHUP: the terminal is gone, so it must not be written to.
+    terminal_lost: bool,
 }
 
 #[cfg(feature = "integration")]
@@ -316,6 +319,7 @@ impl Application {
             signal::SIGUSR1,
             signal::SIGTERM,
             signal::SIGINT,
+            signal::SIGHUP,
         ])
         .context("build signal handler")?;
 
@@ -336,6 +340,7 @@ impl Application {
             theme_mode,
             #[cfg(unix)]
             sidebar_follow: crate::sidebar_follow::SidebarFollow::from_env(),
+            terminal_lost: false,
         };
 
         Ok(app)
@@ -374,7 +379,13 @@ impl Application {
         self.editor.cursor_cache.reset();
 
         let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
-        self.terminal.draw(pos, kind).unwrap();
+        // A failed draw means the terminal is gone (its pane or window
+        // closed while something was being rendered): quit as on SIGHUP
+        // instead of panicking, so the usual shutdown still runs.
+        if let Err(err) = self.terminal.draw(pos, kind) {
+            log::error!("terminal draw failed, quitting: {err}");
+            self.terminal_lost = true;
+        }
     }
 
     pub async fn event_loop<S>(&mut self, input_stream: &mut S)
@@ -395,7 +406,7 @@ impl Application {
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
     {
         loop {
-            if self.editor.should_close() {
+            if self.editor.should_close() || self.terminal_lost {
                 return false;
             }
 
@@ -410,7 +421,9 @@ impl Application {
                     };
                 }
                 Some(event) = input_stream.next() => {
-                    self.handle_terminal_events(event).await;
+                    if !self.handle_terminal_events(event).await {
+                        return false;
+                    }
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
                     if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback))) {
@@ -659,6 +672,12 @@ impl Application {
                 self.restore_term().unwrap();
                 return false;
             }
+            signal::SIGHUP => {
+                // The terminal hung up (its window or pane closed). Writing to
+                // it now fails, so quit without restoring it.
+                self.terminal_lost = true;
+                return false;
+            }
             _ => unreachable!(),
         }
 
@@ -786,17 +805,30 @@ impl Application {
         false
     }
 
-    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) {
+    /// Returns false when the terminal can no longer be read: the editor
+    /// then quits the way it does on SIGHUP.
+    pub async fn handle_terminal_events(&mut self, event: std::io::Result<TerminalEvent>) -> bool {
         #[cfg(not(windows))]
         use termina::escape::csi;
 
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                // The terminal is gone (its pane or window closed) or its
+                // input is broken. Quit instead of panicking, so language
+                // servers are shut down and the exit path runs as usual.
+                log::error!("terminal input failed, quitting: {err}");
+                self.terminal_lost = true;
+                return false;
+            }
+        };
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             jobs: &mut self.jobs,
             scroll: None,
         };
         // Handle key events
-        let should_redraw = match event.unwrap() {
+        let should_redraw = match event {
             #[cfg(not(windows))]
             termina::Event::WindowResized(termina::WindowSize { rows, cols, .. }) => {
                 self.terminal
@@ -861,6 +893,7 @@ impl Application {
         if should_redraw && !self.editor.should_close() {
             self.render().await;
         }
+        true
     }
 
     pub async fn handle_socket_command(&mut self, command: anyhow::Result<MappableCommand>) {
@@ -1091,33 +1124,33 @@ impl Application {
                         // do nothing
                     }
                     Notification::Exit => {
-                        let status =
-                            format!("Language server exited: {}", language_server!().name());
-                        self.editor.set_status(status);
+                        // `:lsp-stop` and `:lsp-restart` remove the server from the
+                        // registry before its exit arrives. Its diagnostics are
+                        // purged either way; the exit hooks (which re-request
+                        // per-document state from the servers still running) only
+                        // fire for a server that was still registered, as before.
+                        let registered = self.editor.language_server_by_id(server_id).is_some();
+                        if registered {
+                            let name = self
+                                .editor
+                                .language_server_by_id(server_id)
+                                .map(|ls| ls.name().to_owned())
+                                .unwrap_or_default();
+                            self.editor
+                                .set_status(format!("Language server exited: {name}"));
+                        }
 
-                        // LSPs may produce diagnostics for files that haven't been opened in helix,
-                        // we need to clear those and remove the entries from the list if this leads to
-                        // an empty diagnostic list for said files
-                        for diags in self.editor.diagnostics.values_mut() {
-                            diags.retain(|(_, provider)| {
-                                provider.language_server_id() != Some(server_id)
+                        self.editor.clear_language_server_diagnostics(server_id);
+
+                        if registered {
+                            helix_event::dispatch(helix_view::events::LanguageServerExited {
+                                editor: &mut self.editor,
+                                server_id,
                             });
+
+                            // Remove the language server from the registry.
+                            self.editor.language_servers.remove_by_id(server_id);
                         }
-
-                        self.editor.diagnostics.retain(|_, diags| !diags.is_empty());
-
-                        // Clear any diagnostics for documents with this server open.
-                        for doc in self.editor.documents_mut() {
-                            doc.clear_diagnostics_for_language_server(server_id);
-                        }
-
-                        helix_event::dispatch(helix_view::events::LanguageServerExited {
-                            editor: &mut self.editor,
-                            server_id,
-                        });
-
-                        // Remove the language server from the registry.
-                        self.editor.language_servers.remove_by_id(server_id);
                     }
                 }
             }
@@ -1485,7 +1518,9 @@ impl Application {
 
         let close_errs = self.close().await;
 
-        self.restore_term()?;
+        if !self.terminal_lost {
+            self.restore_term()?;
+        }
 
         for err in close_errs {
             self.editor.exit_code = 1;

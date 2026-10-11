@@ -15,7 +15,9 @@ use helix_view::events::{
     DiagnosticsDidChange, DocumentDidChange, DocumentDidOpen, LanguageServerInitialized,
 };
 use helix_view::handlers::diagnostics::DiagnosticEvent;
-use helix_view::handlers::lsp::{PullAllDocumentsDiagnosticsEvent, PullDiagnosticsEvent};
+use helix_view::handlers::lsp::{
+    pull_diagnostic_provider, PullAllDocumentsDiagnosticsEvent, PullDiagnosticsEvent,
+};
 use helix_view::handlers::Handlers;
 use helix_view::{DocumentId, Editor};
 
@@ -182,23 +184,7 @@ fn request_document_diagnostics_for_language_servers(
                     .cloned(),
             )?;
 
-            let identifier = language_server
-                .capabilities()
-                .diagnostic_provider
-                .as_ref()
-                .and_then(|diagnostic_provider| match diagnostic_provider {
-                    lsp::DiagnosticServerCapabilities::Options(options) => {
-                        options.identifier.clone()
-                    }
-                    lsp::DiagnosticServerCapabilities::RegistrationOptions(options) => {
-                        options.diagnostic_options.identifier.clone()
-                    }
-                });
-
-            let provider = DiagnosticProvider::Lsp {
-                server_id: language_server_id,
-                identifier,
-            };
+            let provider = pull_diagnostic_provider(language_server)?;
             let uri = doc.uri()?;
 
             Some(async move {
@@ -293,6 +279,11 @@ fn handle_pull_diagnostics_response(
     uri: Uri,
     document_id: DocumentId,
 ) {
+    // Closing the document dropped its pulled diagnostics; a response still in
+    // flight then must not bring them back with nothing left to refresh them.
+    if editor.document(document_id).is_none() {
+        return;
+    }
     match result {
         lsp::DocumentDiagnosticReportResult::Report(report) => {
             let result_id = match report {

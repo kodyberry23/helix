@@ -1943,6 +1943,11 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         valid
     };
 
+    // Purge their diagnostics now rather than when their exit notification
+    // lands, so no stale marker survives the shutdown window. Collected before
+    // the registry forgets them.
+    let stopped_ids = language_server_ids_by_name(cx.editor, &language_servers);
+
     let mut errors = Vec::new();
     for server in language_servers.iter() {
         match cx
@@ -1984,6 +1989,10 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
         })
         .collect();
 
+    for id in stopped_ids {
+        cx.editor.clear_language_server_diagnostics(id);
+    }
+
     for document_id in document_ids_to_refresh {
         cx.editor.refresh_language_servers(document_id);
     }
@@ -2022,19 +2031,41 @@ fn lsp_stop(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
         valid
     };
 
+    // Purge their diagnostics now rather than when their exit notification
+    // lands, so no stale marker survives the stop. Collected before the
+    // registry forgets them.
+    let stopped_ids = language_server_ids_by_name(cx.editor, &language_servers);
+
     for ls_name in &language_servers {
         cx.editor.language_servers.stop(ls_name);
 
+        // Diagnostics are purged below, for every document, by server id.
         for doc in cx.editor.documents_mut() {
-            if let Some(client) = doc.remove_language_server_by_name(ls_name) {
-                doc.clear_diagnostics_for_language_server(client.id());
+            if doc.remove_language_server_by_name(ls_name).is_some() {
                 doc.reset_all_inlay_hints();
                 doc.inlay_hints_oudated = true;
             }
         }
     }
 
+    for id in stopped_ids {
+        cx.editor.clear_language_server_diagnostics(id);
+    }
+
     Ok(())
+}
+
+/// Every running client of the named language servers, in all workspaces.
+fn language_server_ids_by_name(
+    editor: &Editor,
+    names: &[impl AsRef<str>],
+) -> Vec<helix_lsp::LanguageServerId> {
+    editor
+        .language_servers
+        .iter_clients()
+        .filter(|client| names.iter().any(|name| name.as_ref() == client.name()))
+        .map(|client| client.id())
+        .collect()
 }
 
 fn tree_sitter_scopes(

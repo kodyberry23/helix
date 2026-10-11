@@ -16,17 +16,20 @@
 //! applies one atomically and, from the same sender, ignores any older than
 //! the last applied, so nothing depends on every write arriving, or arriving
 //! in order; `sender` names this process, so a restarted editor is taken as
-//! is rather than having to outrun the old one's count. The latest snapshot
+//! is rather than having to outrun the old one's count. The first snapshot
+//! is sent even when empty, which registers this editor as a sender. The
+//! sidebar (treelix 0.1.25 and later) shows the union of every live sender's
+//! latest snapshot and prunes senders whose process is gone, so editors that
+//! share a sidebar never overwrite each other's markers. The latest snapshot
 //! is also sent with every reveal, so a sidebar restarted later catches up
 //! at the next buffer switch. On exit the editor flushes any snapshot still
 //! queued and appends a farewell (`diagnostics-bye <sender> <seq>`) to it on
-//! the same connection: an empty snapshot the sidebar applies only if this
-//! editor's snapshot is the one on display, so a file whose fix the language
-//! server never got to report does not stay marked after the editor is gone
-//! (and a second editor sharing the sidebar keeps its own markers).
+//! the same connection. The farewell retracts only this editor's markers, so
+//! a file whose fix the language server never got to report does not stay
+//! marked after the editor is gone, and other editors' markers stay.
 //!
 //! Why a render() poll and not a DocumentFocusLost/DocumentDidOpen hook:
-//! event coverage is incomplete — `Editor::close` and
+//! event coverage is incomplete. `Editor::close` and
 //! `Editor::close_document` change the focused document without dispatching
 //! any focus event, and the `Action::Load` startup path (`hx a b`) never
 //! focuses the opened docs at dispatch time. The poll is the one chokepoint
@@ -37,7 +40,7 @@
 //! fingerprinting `editor.diagnostics` per frame (no allocation) covers both.
 //! All socket writes happen on one long-lived sender thread, in order, fed
 //! through a latest-wins slot (a stalled sidebar cannot make anything queue
-//! up), and failures are ignored — a missing, stale, or wedged sidebar must
+//! up), and failures are ignored: a missing, stale, or wedged sidebar must
 //! never affect the editor. That includes quitting: the wait for the farewell
 //! is bounded (`SHUTDOWN_FLUSH`), and it runs after the terminal is restored.
 
@@ -226,8 +229,8 @@ impl SidebarFollow {
     }
 
     /// Push a new snapshot when the per-file error/warning counts changed.
-    /// The first one is sent even when empty: it replaces whatever a previous
-    /// editor left in the sidebar.
+    /// The first one is sent even when empty: it registers this editor with
+    /// the sidebar, which shows the union of all live editors' snapshots.
     fn sync_diagnostics(&mut self, editor: &Editor) {
         let fingerprint = fingerprint(&editor.diagnostics);
         if self.seq > 0 && fingerprint == self.fingerprint {

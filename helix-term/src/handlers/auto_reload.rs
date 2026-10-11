@@ -53,6 +53,8 @@ impl ReloadHandler {
             let mut vcs_reload = false;
             // Changed files no buffer holds, for the language servers.
             let mut unopened: Vec<PathBuf> = Vec::new();
+            // Deleted paths no buffer holds, whose diagnostics may be stale.
+            let mut deleted: Vec<PathBuf> = Vec::new();
 
             for fs_event in &*fs_events {
                 // Renames (e.g. git committing a ref via <ref>.lock) surface as
@@ -73,6 +75,10 @@ impl ReloadHandler {
                     {
                         unopened.push(path.to_path_buf());
                     }
+                    if fs_event.ty == EventType::Delete && !deleted.iter().any(|seen| seen == path)
+                    {
+                        deleted.push(path.to_path_buf());
+                    }
                     continue;
                 };
                 if fs_event.ty != EventType::Modified {
@@ -83,6 +89,12 @@ impl ReloadHandler {
             }
 
             recheck_unopened(editor, &unopened);
+
+            // A path recreated since its delete was reported (a save by
+            // rename, a checkout) keeps its diagnostics. One pass for the
+            // whole batch: a checkout can delete thousands of files at once.
+            deleted.retain(|path| !path.exists());
+            editor.forget_unopened_diagnostics_under_all(&deleted);
 
             if vcs_reload {
                 reload_vcs_diffs(editor);

@@ -8,6 +8,7 @@ use crate::events::{
 };
 use crate::{DocumentId, Editor, ViewId};
 use helix_core::diagnostic::DiagnosticProvider;
+use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::Uri;
 use helix_event::register_hook;
 use helix_lsp::util::generate_transaction_from_edits;
@@ -294,8 +295,8 @@ impl Editor {
             .find(|doc| doc.uri().is_some_and(|u| u == uri));
 
         if let Some((version, doc)) = version.zip(doc.as_ref()) {
-            if version != doc.version() {
-                log::info!("Version ({version}) is out of date for {uri:?} (expected ({})), dropping PublishDiagnostic notification", doc.version());
+            if publish_is_out_of_date(version, doc.version(), &diagnostics) {
+                log::info!("Version ({version}) is out of date for {uri:?} (expected ({})), dropping {} diagnostics from PublishDiagnostic notification", doc.version(), diagnostics.len());
                 return;
             }
         }
@@ -431,6 +432,73 @@ pub fn register_hooks(_handlers: &Handlers) {
             language_server.text_document_did_close(event.doc.identifier());
         }
 
+        // Pulled diagnostics are only requested for open documents, so nothing
+        // would update them after the close (and a deleted file's are dropped
+        // whole: no server will report on it again). Pushed ones stay.
+        if let Some(uri) = event.doc.uri() {
+            let gone = event.doc.path().is_some_and(|path| !path.exists());
+            let pull_providers: Vec<_> = event
+                .doc
+                .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
+                .filter_map(pull_diagnostic_provider)
+                .collect();
+            if let Entry::Occupied(mut entry) = event.editor.diagnostics.entry(uri) {
+                if gone {
+                    entry.remove();
+                } else {
+                    entry
+                        .get_mut()
+                        .retain(|(_, provider)| !pull_providers.contains(provider));
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
+
         Ok(())
     });
+}
+
+/// The provider that diagnostics pulled from `language_server` are stored
+/// under, or `None` if it does not support pulling them.
+pub fn pull_diagnostic_provider(language_server: &helix_lsp::Client) -> Option<DiagnosticProvider> {
+    let identifier = match language_server
+        .capabilities()
+        .diagnostic_provider
+        .as_ref()?
+    {
+        lsp::DiagnosticServerCapabilities::Options(options) => options.identifier.clone(),
+        lsp::DiagnosticServerCapabilities::RegistrationOptions(options) => {
+            options.diagnostic_options.identifier.clone()
+        }
+    };
+    Some(DiagnosticProvider::Lsp {
+        server_id: language_server.id(),
+        identifier,
+    })
+}
+
+/// A publish for an older document version is dropped, because its ranges
+/// refer to text that has since changed. An empty one has no ranges, so the
+/// clear it carries still applies.
+fn publish_is_out_of_date(published: i32, current: i32, diagnostics: &[lsp::Diagnostic]) -> bool {
+    published != current && !diagnostics.is_empty()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn out_of_date_publish_is_dropped_unless_it_clears() {
+        let one = [lsp::Diagnostic::new_simple(
+            lsp::Range::default(),
+            "boom".into(),
+        )];
+        assert!(publish_is_out_of_date(3, 4, &one));
+        assert!(!publish_is_out_of_date(3, 4, &[]));
+        assert!(!publish_is_out_of_date(4, 4, &one));
+        assert!(!publish_is_out_of_date(4, 4, &[]));
+    }
 }

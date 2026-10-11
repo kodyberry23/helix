@@ -26,7 +26,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::{self, stdin},
     num::{NonZeroU8, NonZeroUsize},
@@ -1351,6 +1351,42 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
+/// Removes the entries `id` reported, and any file left with none.
+fn remove_language_server_diagnostics(diagnostics: &mut Diagnostics, id: LanguageServerId) {
+    diagnostics.retain(|_, diags| {
+        diags.retain(|(_, provider)| provider.language_server_id() != Some(id));
+        !diags.is_empty()
+    });
+}
+
+/// `path` as given (made absolute) and with symlinks resolved, since servers
+/// may report under either (macOS /tmp is /private/tmp). The path itself may
+/// be gone, so only its parent is resolved.
+fn deleted_path_spellings(path: &Path) -> Vec<PathBuf> {
+    let path = canonicalize(path);
+    let resolved = path
+        .parent()
+        .zip(path.file_name())
+        .and_then(|(parent, name)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+    let mut spellings = vec![path];
+    spellings.extend(resolved.filter(|resolved| *resolved != spellings[0]));
+    spellings
+}
+
+/// Removes the files at or under any of `roots` that are not open.
+fn forget_unopened_under(
+    diagnostics: &mut Diagnostics,
+    roots: &[&Path],
+    is_open: impl Fn(&Uri) -> bool,
+) {
+    diagnostics.retain(|uri, _| {
+        is_open(uri)
+            || !uri
+                .as_path()
+                .is_some_and(|path| roots.iter().any(|root| path.starts_with(root)))
+    });
+}
+
 /// State for an armed window picker (see `Editor::pending_window_pick`).
 /// Each entry maps a visible split's `ViewId` to the key char the resolving
 /// keypress is matched against (case-insensitively) plus the pre-rendered
@@ -1746,6 +1782,76 @@ impl Editor {
             .map(|client| &**client)
     }
 
+    /// Drops every diagnostic the language server `id` reported: the
+    /// workspace-wide list (which also holds files no buffer has open) and
+    /// each document's own copy.
+    pub fn clear_language_server_diagnostics(&mut self, id: LanguageServerId) {
+        remove_language_server_diagnostics(&mut self.diagnostics, id);
+        for doc in self.documents_mut() {
+            doc.clear_diagnostics_for_language_server(id);
+        }
+    }
+
+    /// Forgets the diagnostics for `path`, or for anything under it if it is
+    /// a directory, after it was deleted or moved away. Files a buffer still
+    /// holds keep theirs: an open document is still diagnosed by its server.
+    pub fn forget_unopened_diagnostics_under(&mut self, path: &Path) {
+        self.forget_unopened_diagnostics_under_all(std::slice::from_ref(&path.to_path_buf()));
+    }
+
+    /// `forget_unopened_diagnostics_under` for a batch of gone paths (a
+    /// checkout, `rm -rf`): one pass over the diagnostics for all of them.
+    pub fn forget_unopened_diagnostics_under_all(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let spellings: Vec<PathBuf> = paths
+            .iter()
+            .flat_map(|path| deleted_path_spellings(path))
+            .collect();
+        let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
+        // Open documents under both their own spelling and the resolved one,
+        // matching how the roots are expanded: a buffer opened through a
+        // symlinked directory is still diagnosed under the resolved path.
+        let open: BTreeSet<Uri> = self
+            .documents()
+            .filter_map(|doc| doc.path())
+            .flat_map(deleted_path_spellings)
+            .map(Uri::from)
+            .collect();
+        forget_unopened_under(&mut self.diagnostics, &roots, |uri| open.contains(uri));
+    }
+
+    /// Drop the diagnostics that were pulled for `doc_id`: only open
+    /// documents are ever pulled, so once its servers stop hearing about the
+    /// document nothing would refresh them. Pushed ones stay, their server
+    /// keeps reporting on the file. If the file is gone from disk nothing
+    /// will report on it again, so everything goes.
+    pub fn drop_pulled_diagnostics(&mut self, doc_id: DocumentId) {
+        let doc = doc!(self, &doc_id);
+        let Some(uri) = doc.uri() else {
+            return;
+        };
+        let gone = doc.path().is_some_and(|path| !path.exists());
+        let pull_providers: Vec<DiagnosticProvider> = doc
+            .language_servers_with_feature(LanguageServerFeature::PullDiagnostics)
+            .filter_map(crate::handlers::lsp::pull_diagnostic_provider)
+            .collect();
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.diagnostics.entry(uri)
+        {
+            if gone {
+                entry.remove();
+                return;
+            }
+            entry
+                .get_mut()
+                .retain(|(_, provider)| !pull_providers.contains(provider));
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+    }
+
     /// Refreshes the language server for a given document
     pub fn refresh_language_servers(&mut self, doc_id: DocumentId) {
         self.launch_language_servers(doc_id)
@@ -1789,6 +1895,7 @@ impl Editor {
         if let Some(doc) = self.document_by_path(old_path) {
             self.set_doc_path(doc.id(), &new_path);
         }
+        self.forget_unopened_diagnostics_under(old_path);
         let is_dir = new_path.is_dir();
         for ls in self.language_servers.iter_clients() {
             // A new language server might have been started in `set_doc_path` and won't
@@ -1895,6 +2002,7 @@ impl Editor {
         } else {
             fs::remove_file(&path)?;
         }
+        self.forget_unopened_diagnostics_under(&path);
 
         for ls in self.language_servers.iter_clients() {
             if !ls.is_initialized() {
@@ -1924,7 +2032,10 @@ impl Editor {
             for language_server in doc.language_servers() {
                 language_server.text_document_did_close(doc.identifier());
             }
+            // Nothing pulls for the old path any more.
+            self.drop_pulled_diagnostics(doc_id);
         }
+        let doc = doc_mut!(self, &doc_id);
         // we need to clear the list of language servers here so that
         // refresh_doc_language/refresh_language_servers doesn't resend
         // text_document_did_close. Since we called `text_document_did_close`
@@ -2886,5 +2997,162 @@ impl CursorCache {
 
     pub fn reset(&self) {
         self.0.set(None)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn diagnostic(message: &str) -> lsp::Diagnostic {
+        lsp::Diagnostic::new_simple(lsp::Range::default(), message.into())
+    }
+
+    fn provider(server_id: LanguageServerId) -> DiagnosticProvider {
+        DiagnosticProvider::Lsp {
+            server_id,
+            identifier: None,
+        }
+    }
+
+    fn uri(path: &str) -> Uri {
+        PathBuf::from(path).into()
+    }
+
+    fn two_servers() -> (LanguageServerId, LanguageServerId) {
+        let mut ids = slotmap::SlotMap::<LanguageServerId, ()>::with_key();
+        (ids.insert(()), ids.insert(()))
+    }
+
+    #[test]
+    fn removing_a_language_server_keeps_other_servers_and_drops_emptied_files() {
+        let (gone, kept) = two_servers();
+        let mut diagnostics = Diagnostics::new();
+        diagnostics.insert(
+            uri("/w/shared.rs"),
+            vec![
+                (diagnostic("from gone"), provider(gone)),
+                (diagnostic("from kept"), provider(kept)),
+            ],
+        );
+        diagnostics.insert(
+            uri("/w/only_gone.rs"),
+            vec![(diagnostic("from gone"), provider(gone))],
+        );
+        diagnostics.insert(
+            uri("/w/only_kept.rs"),
+            vec![(diagnostic("from kept"), provider(kept))],
+        );
+
+        remove_language_server_diagnostics(&mut diagnostics, gone);
+
+        assert_eq!(
+            diagnostics.keys().cloned().collect::<Vec<_>>(),
+            vec![uri("/w/only_kept.rs"), uri("/w/shared.rs")]
+        );
+        assert!(diagnostics
+            .values()
+            .flatten()
+            .all(|(_, provider)| provider.language_server_id() == Some(kept)));
+    }
+
+    #[test]
+    fn forgetting_a_path_covers_the_file_and_everything_under_it() {
+        let (server, _) = two_servers();
+        let mut diagnostics = Diagnostics::new();
+        for path in [
+            "/w/gone.rs",
+            "/w/gone.rs.bak",
+            "/w/dir/a.rs",
+            "/w/dir/sub/b.rs",
+            "/w/dir/open.rs",
+            "/w/dirt/c.rs",
+            "/w/kept.rs",
+        ] {
+            diagnostics.insert(uri(path), vec![(diagnostic("x"), provider(server))]);
+        }
+        let open = uri("/w/dir/open.rs");
+
+        forget_unopened_under(&mut diagnostics, &[Path::new("/w/gone.rs")], |u| *u == open);
+        forget_unopened_under(&mut diagnostics, &[Path::new("/w/dir")], |u| *u == open);
+
+        // Matching is by path component, so siblings that merely share a
+        // prefix (`gone.rs.bak`, `dirt`) stay, and so does the open file.
+        assert_eq!(
+            diagnostics.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                uri("/w/dir/open.rs"),
+                uri("/w/dirt/c.rs"),
+                uri("/w/gone.rs.bak"),
+                uri("/w/kept.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn forgetting_a_path_matches_any_of_its_spellings() {
+        let (server, _) = two_servers();
+        let mut diagnostics = Diagnostics::new();
+        diagnostics.insert(
+            uri("/private/tmp/w/a.rs"),
+            vec![(diagnostic("x"), provider(server))],
+        );
+        diagnostics.insert(
+            uri("/tmp/w/b.rs"),
+            vec![(diagnostic("x"), provider(server))],
+        );
+        diagnostics.insert(
+            uri("/tmp/v/c.rs"),
+            vec![(diagnostic("x"), provider(server))],
+        );
+
+        forget_unopened_under(
+            &mut diagnostics,
+            &[Path::new("/tmp/w"), Path::new("/private/tmp/w")],
+            |_| false,
+        );
+
+        assert_eq!(
+            diagnostics.keys().cloned().collect::<Vec<_>>(),
+            vec![uri("/tmp/v/c.rs")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forgetting_a_deleted_file_resolves_its_parent() {
+        // The file itself is gone, so only its directory can be resolved.
+        // Reached through a symlink (as macOS /tmp is), the server reports
+        // the resolved spelling while the editor holds the given one.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link_dir = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        let real_dir = std::fs::canonicalize(&real_dir).unwrap();
+
+        let given = link_dir.join("deleted.rs");
+        let spellings = deleted_path_spellings(&given);
+        assert_eq!(spellings, vec![given.clone(), real_dir.join("deleted.rs")]);
+
+        let (server, _) = two_servers();
+        let mut diagnostics = Diagnostics::new();
+        for path in [
+            &given,
+            &real_dir.join("deleted.rs"),
+            &real_dir.join("kept.rs"),
+        ] {
+            diagnostics.insert(
+                path.clone().into(),
+                vec![(diagnostic("x"), provider(server))],
+            );
+        }
+        let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
+        forget_unopened_under(&mut diagnostics, &roots, |_| false);
+
+        assert_eq!(
+            diagnostics.keys().cloned().collect::<Vec<_>>(),
+            vec![Uri::from(real_dir.join("kept.rs"))]
+        );
     }
 }
